@@ -39,7 +39,7 @@ export async function apply(root) {
 
   // 2. Them bubble vao remotePlayers Map type: them truong bubble?:HTMLDivElement, bubbleT?:number
   const mapDecl = "remotePlayers=new Map<string,{mesh:T.Group;pose:RemotePose}>();";
-  const mapDeclNew = "remotePlayers=new Map<string,{mesh:T.Group;pose:RemotePose;bubble?:HTMLDivElement;bubbleT?:number}>(); // v5.17: chat bubble";
+  const mapDeclNew = "remotePlayers=new Map<string,{mesh:T.Group;pose:RemotePose;bubble?:HTMLDivElement;bubbleT?:number}>();";
   if (code.includes(mapDecl)) {
     code = code.replace(mapDecl, mapDeclNew);
   }
