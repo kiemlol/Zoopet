@@ -5,7 +5,7 @@
 
 import { readdir, readFile, writeFile, unlink, mkdir } from 'fs/promises';
 import { join, dirname, sep } from 'path';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { execSync } from 'child_process';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -77,12 +77,30 @@ async function applyPatchBundles(patchesDirName) {
   }
 }
 
+// Chay cac patch dang script (VD: sua phau thuat 1 file lon khong nhét vua patchbundle).
+// Moi file patches/*.patch.mjs phai export async function apply(root).
+async function applyPatchScripts(patchesDirName) {
+  const patchesDir = join(root, patchesDirName);
+  let files;
+  try {
+    files = (await readdir(patchesDir)).filter((f) => f.endsWith('.patch.mjs')).sort();
+  } catch {
+    return;
+  }
+  for (const f of files) {
+    console.log(`[patch] dang chay ${patchesDirName}/${f}...`);
+    const mod = await import(pathToFileURL(join(patchesDir, f)).href);
+    await mod.apply(root);
+  }
+}
+
 // 1. Source code (text)
 await restoreArchive('archive', 'src-text.tar.gz');
 // 2. Assets binary (public/: model .glb, anh, am thanh)
 await restoreArchive('public-archive', 'public.tar.gz');
 // 3. Hotfix chua co trong archive/
 await applyPatchBundles('patches');
+await applyPatchScripts('patches');
 
 console.log('[restore] HOAN TAT! Chay tiep:');
 console.log('  npm install        # cai dependencies');
