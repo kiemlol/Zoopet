@@ -115,18 +115,14 @@ export async function apply(root) {
     }
 
     // 4. WebSocket: kem ?token= vao URL
-    // Tim: new WebSocket(
-    const wsPattern = /new WebSocket\(`\$\{serviceBase\}socket`\)/;
-    if (wsPattern.test(onlineCode)) {
-      onlineCode = onlineCode.replace(wsPattern, "new WebSocket(`${serviceBase}socket${authToken?`?token=${encodeURIComponent(authToken)}`:''}`)");
+    // Code goc: const socketUrl=new URL(`${serviceBase}socket`,location.href);
+    //            socketUrl.protocol=...; socket=new WebSocket(socketUrl);
+    // Them token vao socketUrl.searchParams
+    const wsUrlPattern = "const socketUrl=new URL(`${serviceBase}socket`,location.href);";
+    const wsUrlNew = "const socketUrl=new URL(`${serviceBase}socket`,location.href);\n    // v5.12: kem token vao WebSocket URL\n    try{if(authToken)socketUrl.searchParams.set('token',authToken);}catch{}";
+    if (onlineCode.includes(wsUrlPattern)) {
+      onlineCode = onlineCode.replace(wsUrlPattern, wsUrlNew);
       frontChanged = true;
-    } else {
-      // Thu pattern khac
-      const ws2 = "new WebSocket(`${serviceBase}socket`)";
-      if (onlineCode.includes(ws2)) {
-        onlineCode = onlineCode.replace(ws2, "new WebSocket(`${serviceBase}socket${authToken?`?token=${encodeURIComponent(authToken)}`:''}`)");
-        frontChanged = true;
-      }
     }
 
     // 5. Logout: xoa token
