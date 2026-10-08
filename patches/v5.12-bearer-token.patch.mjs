@@ -76,6 +76,20 @@ export async function apply(root) {
     console.log('[v5.12] backend da patch roi.');
   }
 
+  // Fix logout: xoa session dung ca Bearer token (khong chi cookie)
+  // Code goc: if (session) await commitSessions(next => next.delete(sessionKey(cookieValue(request))));
+  // Loi: tren Chrome cookie bi chan -> cookieValue=null -> khong xoa duoc session -> bao loi
+  let serverCode2 = await fs.readFile(serverFile, 'utf8');
+  if (!serverCode2.includes('v5.12 logout fix')) {
+    const oldLogout = "if (session) await commitSessions(next => next.delete(sessionKey(cookieValue(request))));";
+    const newLogout = "if (session) { const _tok = bearerToken(request) || cookieValue(request); if (_tok) await commitSessions(next => next.delete(sessionKey(_tok))); } // v5.12 logout fix";
+    if (serverCode2.includes(oldLogout)) {
+      serverCode2 = serverCode2.replace(oldLogout, newLogout);
+      await fs.writeFile(serverFile, serverCode2);
+      console.log('[v5.12] fixed logout to use Bearer token.');
+    }
+  }
+
   // === FRONTEND ===
   const onlineFile = path.join(root, 'src', 'online.ts');
   let onlineCode = await fs.readFile(onlineFile, 'utf8');
