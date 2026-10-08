@@ -31,7 +31,9 @@ async function restoreArchive(archiveDirName, outputName) {
   const tgzPath = join(root, outputName);
   await writeFile(tgzPath, Buffer.from(b64, 'base64'));
   console.log(`[restore] dang giai nen ${outputName}...`);
-  execSync(`tar -xzf "${tgzPath}" -C "${root}"`, { stdio: 'inherit' });
+  // Bo qua render.yaml trong archive de giu ban moi nhat o root repo
+  const exclude = outputName === 'src-text.tar.gz' ? `--exclude='./render.yaml'` : '';
+  execSync(`tar -xzf "${tgzPath}" -C "${root}" ${exclude}`, { stdio: 'inherit' });
   await unlink(tgzPath);
   console.log(`[restore] xong ${archiveDirName}.`);
 }
