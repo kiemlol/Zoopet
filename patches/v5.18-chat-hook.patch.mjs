@@ -13,26 +13,21 @@ export async function apply(root) {
   }
 
   // 1. Khi nhan chat: goi sayRemote
-  // Tim cho xu ly message.type==='chat'
-  // Pattern hien tai: chat.push({name,message}) hoac tuong tu
-  // Them goi sayRemote sau khi push
-  const chatPushPatterns = [
-    "chat.push({name,message}); try{__showChatLine(name,message);}catch{}",
-    "chat.push({name,message})"
-  ];
-  for (const pat of chatPushPatterns) {
-    if (code.includes(pat)) {
-      // Can biet id cua nguoi gui - tim bien id gan do
-      // Don gian: them try-catch goi sayRemote neu co id
-      const replacement = pat + `;
-    // v5.18: hien bong bong tren dau
+  // Code goc: else if(message.type==='chat'&&!restoring&&chatRoom){chat.push({name:String(message.name),message:String(message.message)});...
+  // message co truong id (từ server broadcast)
+  const chatPattern = "chat.push({name:String(message.name),message:String(message.message)})";
+  if (code.includes(chatPattern)) {
+    const replacement = chatPattern + `;
+    // v5.18: hien bong bong tren dau nguoi gui (message.id tu server)
     try{
-      const _id = (typeof id!=='undefined'?id:null) || (typeof senderId!=='undefined'?senderId:null);
-      if(_id && typeof world==='function'){ const w=world() as unknown as {sayRemote?:(i:string,m:string)=>void}; w.sayRemote?.(_id, message); }
+      const _mid = (message as unknown as {id?:string}).id;
+      const _mmsg = String((message as unknown as {message?:string}).message||'');
+      if(_mid && typeof world==='function'){
+        const w=world() as unknown as {sayRemote?:(i:string,m:string)=>void};
+        w.sayRemote?.(_mid, _mmsg);
+      }
     }catch{}`;
-      code = code.replace(pat, replacement);
-      break;
-    }
+    code = code.replace(chatPattern, replacement);
   }
 
   // 2. Goi updateChatBubbles moi frame: them vao game.onFrame
