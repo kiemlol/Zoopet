@@ -13,10 +13,11 @@ export async function apply(root) {
   }
 
   // 1. Them bien danh dau che do bat buoc dang nhap
-  const marker = "let authSubmit:HTMLButtonElement|null=null;";
-  const forcedVar = marker + "\n  // v5.14: auto-show auth - hien modal dang nhap ngay khi mo game neu chua co token.\n  let forcedAuth=false;";
-  if (code.includes(marker)) {
-    code = code.replace(marker, forcedVar);
+  // v5.16 fix: khai bao som, truoc khi dialog duoc tao (de v5.15 dung duoc)
+  const marker14 = "const dialog=el('dialog','social-dialog');";
+  const forcedVar14 = "let forcedAuth=false; // v5.14: auto-show auth\n  " + marker14;
+  if (code.includes(marker14) && !code.includes('let forcedAuth=false; // v5.14')) {
+    code = code.replace(marker14, forcedVar14);
   }
 
   // 2. Trong ham render(): neu forcedAuth thi an nut X
@@ -46,7 +47,7 @@ export async function apply(root) {
     "  (begin as unknown as (s:unknown)=>void)=(s:unknown)=>{\n" +
     "    const wasForced=forcedAuth;\n" +
     "    forcedAuth=false;\n" +
-    "    __origBegin(s);\n" +
+    "    (__origBegin as (s:unknown)=>void)(s);\n" +
     "    if(wasForced){\n" +
     "      try{location.reload();}catch{}\n" +
     "    }\n" +
