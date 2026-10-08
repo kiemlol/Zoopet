@@ -15,15 +15,16 @@ export async function apply(root) {
 
   // Tim dong set mesh.position trong applyEnemySnapshots va xoa no
   // (giu lai rotation va visible).
-  const oldSnippet = "e.scaled=true;e.mesh.position.set(e.x,terrainHeight(this.environment.layout,e)+(e.lift??0),e.z);e.mesh.rotation.y=snapshot.facing??0;";
-  const newSnippet = "e.scaled=true;/* v5.11: khong set mesh.position truc tiep o day, de draw lam muot qua e.smooth */e.mesh.rotation.y=snapshot.facing??0;";
+  // Dung regex de robust hon (tranh loi whitespace/format khac nhau)
+  const pattern = /e\.scaled=true;e\.mesh\.position\.set\(e\.x,terrainHeight\(this\.environment\.layout,e\)\+\(e\.lift\?\?0\),e\.z\);e\.mesh\.rotation\.y=snapshot\.facing\?\?0;/;
+  const replacement = "e.scaled=true;/* v5.11: khong set mesh.position truc tiep o day, de draw lam muot qua e.smooth */e.mesh.rotation.y=snapshot.facing??0;";
 
-  if (!code.includes(oldSnippet)) {
-    console.log('[v5.11] khong thay mau, bo qua.');
+  if (!pattern.test(code)) {
+    console.log('[v5.11] khong thay mau (regex), bo qua.');
     return;
   }
 
-  code = code.replace(oldSnippet, newSnippet);
+  code = code.replace(pattern, replacement);
   await fs.writeFile(file, code);
   console.log('[v5.11] patched src/world.ts: bo set mesh.position truc tiep trong applyEnemySnapshots.');
 }
