@@ -1,1 +1,1 @@
-v5.7c fix - rebuild at 2026-10-08 19:50
+rebuild 2026-10-08 20:01 - v5.7d
