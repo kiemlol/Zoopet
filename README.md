@@ -4,11 +4,14 @@ A browser adventure game (trồng cây, câu cá, săn quái, bay vũ trụ, mul
 
 ## Khôi phục source từ GitHub
 
-Source code đầy đủ được lưu trong `archive/` (chia thành 18 phần `.b64` do giới hạn kỹ thuật). Sau khi clone repo:
+Toàn bộ source code và assets được lưu trên git dưới dạng nén chia nhỏ (do giới hạn kỹ thuật khi push):
+- `archive/` (18 phần) — source code text (src, server, configs...)
+- `public-archive/` (68 phần) — assets binary (model `.glb`, ảnh, âm thanh trong `public/`)
+
+Sau khi clone repo, khôi phục bằng 1 lệnh:
 
 ```sh
-node scripts/restore.mjs   # ghép + giải nén source
-npm run prebuild           # giải mã assets binary (.b64 -> file thật)
+node scripts/restore.mjs   # ghép + giải nén TẤT CẢ (source + public/)
 npm install
 npm run dev
 ```
