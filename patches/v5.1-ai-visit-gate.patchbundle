@@ -1,0 +1,995 @@
+# ZOO-PET-PATCH-BUNDLE v5.1 — hotfix: ket thuc tham nha AI khi di qua cong
+# Ly do: archive/ tren repo van chua code cu (bug common-gates v5). Bundle nay dap
+# 4 file da sua LEN source sau khi restore.mjs giai nen archive/.
+# KHI archive/ duoc tai tao DA GOM FIX: xoa thu muc patches/ va doan applyPatchBundle
+# trong scripts/restore.mjs.
+# Dinh dang: "@@@ZOO_PATCH_FILE@@@ <duong dan tu root repo>" roi den NGUYEN VAN noi dung file.
+
+@@@ZOO_PATCH_FILE@@@ src/common-gates.ts
+/**
+ * Cổng khu chung — cơ chế liền mạch kiểu bản web gốc.
+ *
+ * KHÔNG di chuyển nhân vật. Chỉ theo dõi vị trí và cập nhật trạng thái khi
+ * người chơi tự đi bộ qua ranh giới vườn (bán kính 18m):
+ * - Trong vườn -> ngoài vườn: ra khu chung
+ * - Ngoài vườn -> trong vườn: về nhà riêng
+ * - Đang thăm nhà người khác + ra ngoài: kết thúc thăm, ở lại khu chung
+ *
+ * Hoạt động cả offline (tự track, không phụ thuộc online).
+ */
+import type { GameBridge } from './game-bridge.ts';
+
+const GARDEN_RADIUS = 18;
+
+// null = chưa khởi tạo, true = trong vườn, false = ngoài vườn (khu chung)
+let wasInside: boolean | null = null;
+let visitingRef: () => string | null = () => null;
+
+export function initCommonGates(game: GameBridge, getVisiting: () => string | null) {
+  visitingRef = getVisiting;
+  game.onFrame(() => {
+    const presence = game.getPresence();
+    if (presence.planet !== 'home') { wasInside = null; return; }
+
+    const r = Math.hypot(presence.x, presence.z);
+    const isInside = r < GARDEN_RADIUS;
+    const visiting = visitingRef();
+
+    if (wasInside === null) {
+      wasInside = isInside;
+      return;
+    }
+    if (wasInside === isInside) return; // chưa qua ranh giới
+
+    // Vừa đi qua ranh giới vườn
+    if (wasInside && !isInside) {
+      // Trong -> ngoài: ra khu chung
+      if (visiting) {
+        // Đang thăm nhà người khác: kết thúc thăm, ở lại vị trí hiện tại (khu chung)
+        // Gọi setVisiting(null) qua gameBridge nếu có, nhưng giữ nguyên vị trí
+        endVisitStayHere(game);
+      } else {
+        game.enterCommon?.();
+      }
+    } else if (!wasInside && isInside) {
+      // Ngoài -> trong: về nhà riêng
+      game.exitCommon?.();
+    }
+    wasInside = isInside;
+  });
+}
+
+/**
+ * Kết thúc thăm nhà nhưng giữ người chơi ở vị trí hiện tại (khu chung),
+ * thay vì bị đưa về nhà mình như mặc định.
+ */
+function endVisitStayHere(game: GameBridge) {
+  const world = game.getWorld() as unknown as { position: { x: number; z: number } };
+  const px = world.position.x, pz = world.position.z;
+  const name = visitingRef();
+  // Visit online thật: báo server, server trả lời rồi tự setVisiting(null).
+  // Visit nhà AI (offline): leaveVisitToCommon() trả false (không socket, hoặc
+  // online.ts không track visit này) → tự dọn ở local + reset state bots
+  // (visitingBot, nút Rời đi). Trước đây nhánh này không bao giờ chạy nên
+  // thăm nhà AI đi qua cổng không bao giờ kết thúc (bug).
+  const handledOnline = game.leaveVisitToCommon?.() ?? false;
+  if (!handledOnline) {
+    if (game.leaveBotVisit) game.leaveBotVisit();
+    else game.setVisiting(null);
+    if (name) game.showNotice(`👋 Đã rời nhà của ${name}. Vào cổng lần nữa là về nhà của bạn.`);
+  }
+  // Giữ nguyên vị trí (đề phòng setVisiting reset vị trí)
+  world.position.x = px;
+  world.position.z = pz;
+}
+
+@@@ZOO_PATCH_FILE@@@ src/online.ts
+import type { GameBridge, NetworkDrop } from './game-bridge.ts';
+import { newGame, cropProgress, ITEMS, type SaveState, type PlanetId, type Difficulty } from './model.ts';
+import type { LookId } from './looks.ts';
+import './online.css';
+import { t, onLanguageChange } from './i18n.ts';
+import {gameplayKey} from './gameplay-controls.ts';
+import type {GameIntent,ActionReply} from './actions.ts';
+
+interface GuestEntry { at:number;by:string;name:string;kind:'visit'|'water'|'gift'|'steal'|'message';what?:string;count?:number;text?:string }
+interface Explorer { id:string;username?:string;name:string;color:string;level:number;gear:SaveState['gear'];look?:LookId;online?:boolean;x?:number;z?:number;y?:number;facing?:number;moving?:boolean;space?:string;planet?:string;difficulty?:string }
+interface Home extends Explorer { discovered?:PlanetId[]; plots:SaveState['plots'];farm?:SaveState['farm'];placed?:unknown[];decorations?:unknown[];helper?:unknown;friends?:unknown[] }
+interface EnemyState { id:string;x:number;z:number;hp:number;maxHp:number;[key:string]:unknown }
+interface NetworkWorld {
+  updateRemotePlayers(players:Explorer[]):void;clearRemotePlayers():void;
+  setNetworkRole(role:'host'|'peer'|null):void;
+  /** The host's difficulty while someone else hosts the room (creature scale, the Settings note); null otherwise. */
+  roomDifficulty:Difficulty|null;
+  enemySnapshots():EnemyState[];applyEnemySnapshots(enemies:EnemyState[]):void;
+  environmentSnapshot():{time:number;lamps:[number,number][]};applyEnvironmentSnapshot(snapshot:{time:number;lamps:[number,number][]}):void;
+  onRemoteDamage:(id:string,amount:number,source?:string,enemyId?:string)=>void;
+  onEnvironmentAction:(action:{kind:'light-pillar'|'collect-ore';id:string;index?:number})=>void;
+  applyEnvironmentAction(action:{kind:'light-pillar'|'collect-ore';id:string;index?:number}):{ok:boolean;rewards?:{id:string;count:number}[]};
+  grantEnvironmentReward(eventId:string,rewards:{id:string;count:number}[]):unknown;
+}
+interface Session { authorityVersion?:number;account:Explorer|null;profile?:SaveState;revision?:number;friends?:Explorer[];requests?:Explorer[] }
+interface ActionJob extends GameIntent {requestId:string;expectedRevision:number;rulesVersion:1;submitted?:boolean;retries?:number}
+interface ChatAttempt { requestId:string;draft:string;accountId:string;room:string;connection:WebSocket;pending:boolean;timer?:number }
+const el = <K extends keyof HTMLElementTagNameMap>(tag:K,className='',text='') => {const node=document.createElement(tag);node.className=className;node.textContent=text;return node;};
+const button=(label:string,action:()=>void,className='')=>{const node=el('button',className,t(label));node.type='button';node.addEventListener('click',action);return node;};
+
+function initSoloEdition() {
+  const dialog=el('dialog','social-dialog');dialog.id='online-dialog';
+  const close=button('✕',()=>dialog.close(),'social-close');
+  const header=el('header','social-header'),heading=el('h2');header.append(heading,close);
+  const content=el('div','social-content'),intro=el('p','social-intro'),details=el('p','social-small'),keepPlaying=button('Keep playing',()=>dialog.close(),'social-primary');
+  content.append(intro,details,keepPlaying);dialog.append(header,content);document.body.append(dialog);
+  const slot=document.querySelector('#social-slot');
+  const toggle=button('🌱',()=>dialog.showModal(),'social-toggle');toggle.id='online-button';toggle.dataset.staticHost='true';
+  if(slot){slot.append(toggle);toggle.classList.add('social-inline-toggle');}else document.body.append(toggle);
+  const refresh=()=>{
+    dialog.setAttribute('aria-label',t('Solo adventure'));close.setAttribute('aria-label',t('Close solo information'));
+    heading.textContent=t('Solo adventure');intro.textContent=t('Explore, grow your garden, and complete every adventure on your own. Your progress saves in this browser.');
+    details.textContent=t('This GitHub Pages edition plays solo. Accounts, friends, and shared worlds are available in the multiplayer edition.');
+    keepPlaying.textContent=t('Keep playing');toggle.textContent=slot?'🌱':`🌱 ${t('Solo adventure')}`;toggle.title=t('Solo adventure');toggle.setAttribute('aria-label',t('About this solo adventure'));
+  };
+  refresh();onLanguageChange(refresh);
+  // If this edition was built with the address of a multiplayer server (VITE_ONLINE_URL), the title screen's "Play online" link shows only while that server answers; otherwise it stays hidden and nothing says "multiplayer".
+  const server=String(import.meta.env.VITE_ONLINE_URL||'').replace(/\/+$/,''),link=document.querySelector<HTMLAnchorElement>('#online-link');
+  if(server&&link){
+    const check=async()=>{
+      const abort=new AbortController(),timer=window.setTimeout(()=>abort.abort(),4000);
+      try{const reply=await fetch(`${server}/api/health`,{headers:{'ngrok-skip-browser-warning':'1'},cache:'no-store',signal:abort.signal}),info=await reply.json();
+        link.hidden=!(reply.ok&&info?.ok);if(!link.hidden)link.textContent=`🌐 ${t('Play online with friends')}${Number.isFinite(info.online)&&info.online>0?` · ${t('{n} online',{n:info.online})}`:''} →`;}
+      catch{link.hidden=true;}finally{clearTimeout(timer);}
+    };
+    void check();window.setInterval(()=>{if(!document.hidden)void check();},60_000);document.addEventListener('visibilitychange',()=>{if(!document.hidden)void check();});
+  }
+}
+
+export function initOnline(game:GameBridge) {
+  // Static hosting has no account API or WebSocket server. Leave local saves intact.
+  if(import.meta.env.VITE_STATIC_HOST==='true'){initSoloEdition();return;}
+  const serviceBase=import.meta.env.BASE_URL;
+  let account:Explorer|null=null,friends:Explorer[]=[],requests:Explorer[]=[],sent:Explorer[]=[],visitLog:GuestEntry[]=[],unreadLog=0,socket:WebSocket|null=null;
+  let host:string|null=null,party:string|null=null,planet='',visiting:string|null=null,zone:'common'|null=null,offline:SaveState|null=null,roomEpoch=0;
+  let reconnect:number|undefined,saveTimer:number|undefined,saving:Promise<void>|null=null,stopped=false,revision=0,sessionEpoch=0;
+  let actionQueue:ActionJob[]=[];const waiting=new Map<string,{resolve:(reply:ActionReply)=>void;reject:(error:Error)=>void}>();
+  const pendingSave=()=>actionQueue.length>0;
+  let poseClock=0,enemyClock=0,tab:'world'|'friends'|'diary'|'account'='world',register=false,status='Play together',authBusy=false;
+  let authSubmit:HTMLButtonElement|null=null;
+  const players=new Map<string,Explorer>(),rewardIds=new Set<string>(),chat:{name:string;message:string}[]=[];
+  let chatRoom:string|null=null,chatDraft='',chatReady=false,chatAttempt:ChatAttempt|null=null;
+  let sharingLoot=false;
+  const toggle=button(`👥 ${t('Play together')}`,()=>{render();dialog.showModal();},'social-toggle');toggle.id='online-button';const socialSlot=document.querySelector('#social-slot');if(socialSlot){socialSlot.append(toggle);toggle.classList.add('social-inline-toggle');}else document.body.append(toggle);toggle.setAttribute('aria-label',t('Play together'));
+  const dialog=el('dialog','social-dialog');dialog.id='online-dialog';dialog.setAttribute('aria-label',t('Play together'));document.body.append(dialog);
+  const header=el('header','social-header'),heading=el('h2','',t('Play together')),close=button('✕',()=>dialog.close(),'social-close');close.setAttribute('aria-label',t('Close online menu'));header.append(heading,close);
+  const tabs=el('nav','social-tabs'),content=el('div','social-content'),notice=el('p','social-notice');notice.setAttribute('role','status');dialog.append(header,tabs,notice,content);
+  dialog.addEventListener('click',event=>{if(event.target===dialog&&event.clientX&&(event.clientX<dialog.getBoundingClientRect().left||event.clientX>dialog.getBoundingClientRect().right))dialog.close();});
+  const world=()=>game.getWorld() as ReturnType<GameBridge['getWorld']> & NetworkWorld;
+  let noticeSource='',noticeParams:Record<string,string|number>={},saveStatusSource='';
+  function setNotice(message:string,params:Record<string,string|number>={}){noticeSource=message;noticeParams=params;notice.textContent=t(message,params);}
+  function announce(message:string,params:Record<string,string|number>={}){setNotice(message,params);game.showNotice(t(message,params));}
+  function setSaveStatus(message:string){saveStatusSource=message;const label=document.querySelector('#save-status');if(label)label.textContent=t(message);}
+  async function api<T>(path:string,data?:unknown,method=data?'POST':'GET'):Promise<T>{
+    // A fetch that never reaches the server (offline, DNS, server down) rejects with the browser's own English text ("Failed to fetch",
+    // "Load failed"): say it in the game's words instead. No status, so flushSave keeps the action for a retry as before.
+    let response:Response;try{response=await fetch(`${serviceBase}api/${path}`,{method,credentials:'same-origin',headers:{'Content-Type':'application/json'},body:data?JSON.stringify(data):undefined});}catch{throw new Error('Connection interrupted. Please try again.');}
+    let value:{error?:string};try{value=await response.json();}catch{throw new Error('Online play needs the game server. Your offline adventure is ready to play.');}
+    if(!response.ok)throw Object.assign(new Error(value.error||'Connection interrupted. Please try again.'),{status:response.status});return value as T;
+  }
+  const send=(value:unknown)=>{if(socket?.readyState===WebSocket.OPEN){socket.send(JSON.stringify(value));return true;}return false;};
+  function captureChatDraft(){const input=content.querySelector<HTMLInputElement>('.social-chat-input');if(input)chatDraft=input.value;}
+  function refreshChatControls(){
+    const input=content.querySelector<HTMLInputElement>('.social-chat-input');if(input)input.value=chatDraft;
+    const submit=content.querySelector<HTMLButtonElement>('.social-chat-send');if(submit){submit.disabled=!!chatAttempt?.pending||!chatReady;submit.textContent=t(chatAttempt?.pending?'Sending…':'Send');}
+  }
+  function stopChatWait(){if(chatAttempt?.timer!==undefined){clearTimeout(chatAttempt.timer);chatAttempt.timer=undefined;}}
+  function releaseChat(message?:string){captureChatDraft();stopChatWait();if(chatAttempt)chatAttempt.pending=false;refreshChatControls();if(message)announce(message);}
+  function clearChat(room:string|null=null){
+    stopChatWait();chatAttempt=null;chatRoom=room;chatDraft='';chatReady=false;chat.length=0;
+    const input=content.querySelector<HTMLInputElement>('.social-chat-input');if(input)input.value='';renderChat();refreshChatControls();
+  }
+  function chatMatches(requestId:unknown,connection:WebSocket){return !!chatAttempt&&chatAttempt.requestId===requestId&&chatAttempt.accountId===account?.id&&chatAttempt.room===chatRoom&&chatAttempt.connection===connection;}
+  function acknowledgeChat(requestId:unknown,connection:WebSocket){
+    if(!chatMatches(requestId,connection))return;captureChatDraft();const sent=chatAttempt!;stopChatWait();
+    if(chatDraft===sent.draft)chatDraft='';chatAttempt=null;refreshChatControls();setNotice('Message sent.');
+  }
+  function submitChat(){
+    captureChatDraft();if(chatAttempt?.pending||!chatDraft.trim())return;
+    if(!account||!chatRoom||!chatReady||socket?.readyState!==WebSocket.OPEN){announce('Chat is reconnecting. Your draft is kept.');return;}
+    // Reuse an uncertain delivery's ID so a retry cannot broadcast an accepted message twice.
+    const previous=chatAttempt,requestId=previous&&previous.accountId===account.id&&previous.room===chatRoom&&previous.draft===chatDraft?previous.requestId:crypto.randomUUID();
+    stopChatWait();const attempt:ChatAttempt={requestId,draft:chatDraft,accountId:account.id,room:chatRoom,connection:socket,pending:true};chatAttempt=attempt;
+    refreshChatControls();setNotice('');
+    try{socket.send(JSON.stringify({type:'chat',message:attempt.draft,requestId}));}
+    catch{releaseChat('Chat is reconnecting. Your draft is kept.');return;}
+    attempt.timer=window.setTimeout(()=>{if(chatAttempt===attempt&&attempt.pending)releaseChat('Message delivery is unconfirmed. Your draft is kept; you can try sending again.');},10000);
+  }
+  function sendRoom(value:{type:string;planet?:string;party?:string|null;id?:string}){
+    if(!send(value))return false;
+    // The server intentionally sends no new joined event for a room we already occupy.
+    const sameRoom=value.type==='join'&&`${value.party?.trim().toUpperCase()||'public'}:${value.planet||'home'}`===chatRoom;
+    if(!sameRoom){captureChatDraft();chatReady=false;refreshChatControls();}return true;
+  }
+
+  /** A private message to a friend, online or not: it shows in their guest diary and pops up if they are playing. */
+  function messageForm(friendId:string,box:HTMLElement){
+    box.replaceChildren(el('h4','',t('Message')));
+    const form=el('form','social-inline'),input=el('input');input.maxLength=120;input.placeholder=t('Write a short message…');input.setAttribute('aria-label',t('Message'));input.name='friend-message';
+    const submit=el('button','',t('Send'));submit.type='submit';form.append(input,submit);
+    form.addEventListener('submit',event=>{event.preventDefault();const text=input.value.trim();if(!text)return;if(send({type:'dm',to:friendId,text})){input.value='';announce('Message sent.');}});
+    box.append(form);input.focus();
+  }
+  /** Gifts: pick things from your bag to hand a friend (server: friends only, a daily limit; it lands in their chest). */
+  function giftPicker(friendId:string,box:HTMLElement){
+    box.replaceChildren(el('h4','',t('Give from your bag')));
+    const bag=Object.entries(game.getState().bag).filter(([id,n])=>(n??0)>0&&ITEMS[id]).sort((a,b)=>(b[1]??0)-(a[1]??0)).slice(0,16);
+    if(!bag.length){box.append(el('p','social-small',t('Your bag is empty.')));return;}
+    const list=el('div','social-actions');
+    for(const [id,n] of bag)list.append(button(`${t(ITEMS[id].name)} ×${n}`,async()=>{try{await queueAction({type:'giftFriend',payload:{ownerId:friendId,item:id,count:1}});announce('Gift sent!');giftPicker(friendId,box);}catch(error){announce((error as Error).message);}}));
+    box.append(list);
+  }
+  function openPlayer(id:string){
+    const player=players.get(id);if(!player||id===account?.id)return;captureChatDraft();render();dialog.showModal();
+    const card=el('section','social-player-card'),title=el('h3','',player.name),actions=el('div','social-actions');card.append(title);
+    if(player.username)card.append(el('p','social-small','@'+player.username));
+    if(friends.some(friend=>friend.id===id)){actions.append(button('Visit garden',()=>{sendRoom({type:'visit',id});dialog.close();}));const gifts=el('div','social-gifts');actions.append(button('Send a gift',()=>giftPicker(id,gifts)),button('Message',()=>messageForm(id,gifts)));card.append(gifts);}
+    else actions.append(button('Send friend request',async()=>{try{await api('friends/request',{id});announce('Friend request sent.');}catch(error){announce((error as Error).message);}}));
+    card.append(actions);content.prepend(card);
+  }
+  world().onRemotePlayerClick=openPlayer;
+  document.addEventListener('keydown',event=>{
+    if(gameplayKey(event)!=='Enter'||event.repeat||(event.target as HTMLElement).closest('input,textarea,select,[contenteditable="true"]'))return;
+    if(document.querySelector('#dialog-layer:not([hidden])')||!account)return;event.preventDefault();captureChatDraft();tab='world';render();if(!dialog.open)dialog.showModal();content.querySelector<HTMLInputElement>('.social-chat-input')?.focus();
+  });
+  /** One line for the guest diary and for the toast when a friend does something at your home. */
+  function guestLine(e:GuestEntry){const what=e.what&&ITEMS[e.what]?t(ITEMS[e.what].name):'';
+    return e.kind==='water'?t('{name} watered your {item}!',{name:e.name,item:what}):e.kind==='gift'?t('{name} sent you a gift: {count} {item}',{name:e.name,count:e.count??1,item:what}):e.kind==='steal'?t('{name} picked your {item}!',{name:e.name,item:what}):e.kind==='message'?`${e.name}: ${e.text??''}`:t('{name} is visiting your garden',{name:e.name});}
+  const ago=(at:number)=>{const s=Math.max(0,(Date.now()-at)/1000);return s<60?t('just now'):s<3600?t('{n} min ago',{n:Math.floor(s/60)}):s<86400?t('{n} h ago',{n:Math.floor(s/3600)}):t('{n} d ago',{n:Math.floor(s/86400)});};
+  function refreshButton(){const label=account?t(status,{code:party||''}):t('Play together');toggle.textContent=socialSlot?'👥':`👥 ${label}`;toggle.dataset.badge=String(requests.length+unreadLog||'');world().friendIds=new Set(friends.map(f=>f.id));toggle.title=label;toggle.setAttribute('aria-label',t('Play together'));dialog.setAttribute('aria-label',t('Play together'));close.setAttribute('aria-label',t('Close online menu'));toggle.dataset.online=String(!!account);}
+  function expireSession(){
+    if(!account)return;game.setDungeonSender?.(null);sessionEpoch++;stopped=true;if(reconnect)clearTimeout(reconnect);if(saveTimer)clearTimeout(saveTimer);
+    clearChat();const previous=socket;socket=null;previous?.close();account=null;host=null;party=null;visiting=null;zone=null;players.clear();rejectActions('Your session ended. Pending actions remain on this device.');
+    authority(null);world().clearRemotePlayers();game.setVisiting(null);game.setPersistence(null);game.setActionHandler(null);const previousOffline=offline||game.getOfflineState();if(previousOffline)game.applyState(previousOffline);offline=null;
+    status='Play together';setSaveStatus('● Offline adventure restored');refreshButton();render();announce('Your online session ended. Sign in again to continue; pending online progress is kept on this device.');
+  }
+  /** Mirrors the host's difficulty into the world (server.mjs presence carries it). */
+  function syncRoomDifficulty(){const d=host&&host!==account?.id?players.get(host)?.difficulty:null;world().roomDifficulty=d==='easy'||d==='normal'||d==='hard'?d:null;}
+  function renderPlayers(){
+    syncRoomDifficulty();
+    const local=game.getPresence();const space=visiting?`home:${visiting}`:zone==='common'?'common':local.planet==='home'&&Math.hypot(local.x,local.z)<18?`home:${account?.id}`:'wild';
+    world().updateRemotePlayers([...players.values()].filter(player=>player.id!==account?.id&&player.planet===local.planet&&(player.space==='wild'||player.space==='common'&&space==='common'||player.space===space)));
+  }
+  /** Đi qua cổng: vào khu chung (Đồng Cỏ Hồ Xanh) */
+  function enterCommon(){zone='common';send({type:'enterCommon'});renderPlayers();announce('Ra khu vực chung - đến gần người chơi khác để gặp & kết bạn!');}
+  /** Đi qua cổng: từ khu chung về nhà riêng */
+  function exitCommon(){zone=null;send({type:'exitCommon'});renderPlayers();announce('Bạn đã về nhà riêng.');}
+  /** Rời nhà đang thăm qua cổng -> về khu chung (không teleport về nhà mình).
+   *  Trả về true khi gửi được cho server (visit online thật — online.ts đang
+   *  track `visiting`). False khi chưa đăng nhập/mất socket, hoặc visit hiện
+   *  tại là nhà AI (bots.ts) mà online.ts không track → caller tự dọn local. */
+  function leaveVisitToCommon(){if(visiting&&send({type:'leaveVisit',toCommon:true}))return true;return false;}
+  function authority(next:string|null,enemies?:EnemyState[]){
+    const becomingHost=next===account?.id&&host!==next;host=next;syncRoomDifficulty();
+    if(enemies?.length&&(becomingHost||host!==account?.id))world().applyEnemySnapshots(enemies);
+    const role=account&&socket?.readyState===WebSocket.OPEN?(host===account.id?'host':'peer'):null;
+    world().setNetworkRole(role);
+    if(!role){world().localPlayerId=account?.id??'local';world().onRemoteDamage=()=>{};world().onEnvironmentAction=()=>{};game.setNetworkHooks({role:null});return;}
+    world().localPlayerId=account?.id??'local';
+    world().onRemoteDamage=(id,_amount,source,enemyId)=>{if(role==='host'&&enemyId)send({type:'damage',id,source,enemyId});};
+    world().onEnvironmentAction=action=>{send({type:'environmentAction',action});};
+    game.setNetworkHooks({role,hit:()=>true,status:()=>true,moveTarget:()=>true,reportDamage:(enemyId,source)=>{if(role==='host')send({type:'damage',id:account?.id,source,enemyId});},visitCrop:index=>{
+      const plot=world().state.plots[index];if(!visiting||!plot?.crop)return;
+      // A growing crop is watered (it ripens sooner for the owner); a ripe one can be picked as before.
+      if(cropProgress(plot)<1){void queueAction({type:'waterFriend',payload:{ownerId:visiting,index,generation:plot.generation}}).then(reply=>{const r=(reply as {result?:{xp?:number;left?:number}}).result;if(r?.xp)announce('💧 You watered the plant: 10% less time to wait. +{xp} XP · {count} waterings left in this garden today.',{xp:r.xp,count:r.left??0});else announce('You watered the plant. It will ripen a little sooner!');}).catch(error=>announce(error.message));return;}
+      void queueAction({type:'stealCrop',payload:{ownerId:visiting,index,generation:plot.generation}}).catch(error=>announce(error.message));
+    }});
+  }
+
+  function rememberActions(){if(!account)return;try{localStorage.setItem(`cute-game-actions-${account.id}`,JSON.stringify(actionQueue));}catch{/* Server receipts also make same-ID retries safe. */}}
+  function rejectActions(message:string){for(const waiter of waiting.values())waiter.reject(new Error(message));waiting.clear();actionQueue=[];}
+  function queueAction(intent:GameIntent):Promise<ActionReply>{
+    if(!account||stopped)return Promise.reject(new Error('Reconnect before changing your online adventure.'));
+    const job:ActionJob={...structuredClone(intent),requestId:`r${revision}-${crypto.randomUUID()}`,expectedRevision:revision,rulesVersion:1};actionQueue.push(job);rememberActions();setSaveStatus('◌ Saving online…');
+    const answer=new Promise<ActionReply>((resolve,reject)=>waiting.set(job.requestId,{resolve,reject}));void flushSave();return answer;
+  }
+  async function shareNearbyLoot(){
+    if(!account||visiting||sharingLoot)return;sharingLoot=true;const actorId=account.id,epoch=sessionEpoch,room=chatRoom;
+    try{
+      const result=await api<{drops:NetworkDrop[]}>('drops');if(account?.id!==actorId||sessionEpoch!==epoch||chatRoom!==room||visiting)return;
+      const here=game.getPresence(),now=Date.now(),own=(result.drops||[]).filter(drop=>drop.owner===actorId&&drop.room===room&&drop.planet===here.planet&&drop.expiresAt>now&&drop.releaseAt>now&&Math.hypot(drop.x-here.x,drop.z-here.z)<=12);
+      if(!own.length){announce('There is no protected loot of yours nearby.');return;}
+      let count=0;for(const drop of own){if(account?.id!==actorId||sessionEpoch!==epoch||chatRoom!==room||visiting)return;await queueAction({type:'releaseDrop',payload:{ownerId:drop.ownerId,id:drop.id}});count++;}
+      if(account?.id===actorId&&sessionEpoch===epoch)announce('Shared {count} nearby loot drops.',{count});
+    }catch(error){if(account?.id===actorId&&sessionEpoch===epoch)announce((error as Error).message);}finally{sharingLoot=false;}
+  }
+  // Progress reaches the server only as an explicit intent, never a profile snapshot.
+  function queueSave(_state:SaveState){if(actionQueue.length)void flushSave();}
+  let retryMs=500; // a failed save is retried quickly at first, then backs off to 5 s
+  async function flushSave(){
+    if(saving)return saving;if(!actionQueue.length||!account||stopped)return;
+    const accountId=account.id,epoch=sessionEpoch;
+    saving=(async()=>{while(actionQueue.length&&account?.id===accountId&&sessionEpoch===epoch&&!stopped){const job=actionQueue[0];
+      try{if(!job.submitted){job.expectedRevision=revision;job.submitted=true;rememberActions();}const {submitted,retries,...body}=job;void submitted;void retries;const reply=await api<ActionReply>('actions',body);if(account?.id!==accountId||sessionEpoch!==epoch)return;
+        if(reply.revision>=revision){revision=reply.revision;game.applyAuthoritativeState(reply.profile);}actionQueue.shift();rememberActions();retryMs=500;waiting.get(job.requestId)?.resolve(reply);waiting.delete(job.requestId);
+        // A new unsubmitted intent follows the revision returned by the preceding transaction.
+        rememberActions();
+        status=socket?.readyState===WebSocket.OPEN?'Online':'Reconnecting';setSaveStatus(actionQueue.length?'◌ Saving online…':'● Saved online');refreshButton();
+      }catch(error){if(account?.id!==accountId||sessionEpoch!==epoch)return;const statusCode=(error as {status?:number}).status;
+        if(statusCode===401){expireSession();return;}
+        if(statusCode===409||statusCode===410||statusCode===426){try{const fresh=await api<Session>('auth/session');if(account?.id!==accountId||sessionEpoch!==epoch)return;if(!fresh.account){expireSession();return;}if(fresh.account.id!==accountId){begin(fresh);return;}revision=fresh.revision||0;if(fresh.profile)game.applyAuthoritativeState(fresh.profile);
+          // Someone else changed this account meanwhile (a visitor watered a crop, say): the action itself is fine, so retry it on the new revision instead of dropping it (the server replays it if the first try had gone through).
+          if(statusCode===409){job.retries=(job.retries??0)+1;if(job.retries<=3){job.expectedRevision=revision;rememberActions();continue;}}}catch{break;}}
+        if(statusCode&&statusCode<500){actionQueue.shift();rememberActions();waiting.get(job.requestId)?.reject(error as Error);waiting.delete(job.requestId);continue;}
+        status='Action pending';setSaveStatus('○ Action pending — reconnect to finish');refreshButton();break;
+      }
+    }})().finally(()=>{saving=null;if(actionQueue.length&&account&&!stopped){if(sessionEpoch!==epoch)void flushSave();else {saveTimer=window.setTimeout(()=>void flushSave(),retryMs);retryMs=Math.min(5000,retryMs*2);}}});
+    return saving;
+  }
+  function connect(){
+    if(!account||stopped)return;releaseChat();chatReady=false;refreshChatControls();let desiredParty=party,restoring=false,fallbackJoin:any=null;const desiredPlanet=game.getPresence().planet;const socketUrl=new URL(`${serviceBase}socket`,location.href);socketUrl.protocol=location.protocol==='https:'?'wss:':'ws:';socket=new WebSocket(socketUrl);
+    const connection=socket;
+    function joined(message:any){
+      if(desiredParty&&message.party!==desiredParty){if(!restoring){restoring=true;fallbackJoin=message;sendRoom({type:'join',planet:desiredPlanet,party:desiredParty});}return;}
+      const nextRoom=typeof message.room==='string'?message.room:`${message.party||'public'}:${message.planet}`;if(chatRoom!==nextRoom)clearChat(nextRoom);chatReady=true;
+      desiredParty=null;restoring=false;if(visiting)game.setVisiting(null);players.clear();for(const player of message.players||[])players.set(player.id,player);party=message.party;planet=message.planet;visiting=typeof message.visiting==='string'?message.visiting:null;
+      // A visit changes the room, never the owner's saved adventure planet.
+      if(message.enemies?.length)world().applyEnemySnapshots(message.enemies);game.clearNetworkDrops();const dropEpoch=++roomEpoch;void api<{drops:NetworkDrop[]}>('drops').then(result=>{if(socket===connection&&roomEpoch===dropEpoch&&chatRoom===nextRoom&&!visiting&&account)for(const drop of result.drops||[])if(drop.room===nextRoom)game.spawnNetworkDrop(drop,account.id);}).catch(()=>{});if(message.environment)world().applyEnvironmentSnapshot(message.environment);authority(message.host,message.enemies);renderPlayers();status=party?'Party {code}':'Online';refreshButton();if(dialog.open)render();else refreshChatControls();
+    }
+    socket.addEventListener('open',()=>{if(socket!==connection)return;status='Online';refreshButton();send({type:'active',active:!document.hidden});void flushSave();game.setDungeonSender?.(value=>socket===connection&&send(value));});
+    socket.addEventListener('message',event=>{
+      if(socket!==connection)return;let message:any;try{message=JSON.parse(event.data);}catch{return;}
+      if(message.type==='welcome'){friends=message.friends||[];requests=message.requests||[];sent=message.sent||[];visitLog=message.visitLog||[];refreshButton();}
+      else if(message.type==='joined')joined(message);
+      else if(message.type==='authority'){if(message.environment)world().applyEnvironmentSnapshot(message.environment);authority(message.host,message.enemies);}
+      else if(message.type==='enter'||message.type==='pose'){if(message.player?.id){const merged=message.delta&&players.has(message.player.id)?{...players.get(message.player.id),...message.player}:message.player;for(const key of Object.keys(merged))if(merged[key]===null)delete (merged as Record<string,unknown>)[key];players.set(message.player.id,merged);}renderPlayers();}
+      else if(message.type==='leave'){players.delete(message.id);renderPlayers();}
+      // The server dropped a pose that outran its movement budget (server/pose-budget.mjs): go back to its spot, so the proximity rules agree with the screen again.
+      else if(message.type==='poseFix'){const w=world();if(message.planet===w.planet&&(message.visit??null)===visiting&&Number.isFinite(message.x)&&Number.isFinite(message.z)){w.position.set(message.x,w.position.y,message.z);w.destination=null;w.route=[];w.selected=null;}}
+      else if(message.type==='enemies')world().applyEnemySnapshots(message.enemies);
+      else if(message.type==='profile'&&message.authorityVersion===1&&message.profile&&message.revision>=revision){revision=message.revision;game.applyAuthoritativeState(message.profile);}
+      else if(message.type==='enemyHealth')world().applyAuthoritativeEnemyHealth(message);
+      else if(message.type==='colossus'||message.type==='colossusHit')dispatchEvent(new CustomEvent('zoo-colossus',{detail:message}));// colossus.ts
+      else if(message.type==='environment')world().applyEnvironmentSnapshot(message.snapshot);
+      else if(message.type==='gardenEvent'){
+        if(message.blocked){
+          const current=world(),farm=current.farmView;
+          const target=()=>{if(world()!==current||current.farmView!==farm||current.planet!=='home'||!(visiting===message.ownerId||!visiting&&account?.id===message.ownerId))return null;const local=message.by===account?.id,thief=local?current.position:players.get(message.by);if(!thief||!Number.isFinite(thief.x)||!Number.isFinite(thief.z)||!local&&players.get(message.by)?.space!==`home:${message.ownerId}`)return null;return{x:thief.x!,z:thief.z!};};
+          const thief=target();if(thief)farm?.guardBite(thief,target);
+          if(message.by===account?.id)announce('The guard dog protected this garden. You lost {damage} HP.',{damage:message.damage||0});
+        }
+        else if(!message.blocked&&message.by===account?.id)announce('Crop collected. {count} visits left here today.',{count:message.remaining||0});
+      }
+      else if(message.type==='dropSpawn'&&message.drop)game.spawnNetworkDrop(message.drop,account!.id);
+      else if(message.type==='dropClaimed')game.removeNetworkDrop(message.id);
+      else if(message.type==='dropReleased')game.releaseNetworkDrop(message.id);
+      else if(message.type==='healthResult')game.applyAuthorityHealth(message.delta||0,!!message.died);
+      else if(typeof message.type==='string'&&message.type.startsWith('dg'))game.dungeonMessage?.(message);
+      else if(message.type==='chatAck')acknowledgeChat(message.requestId,connection);
+      else if(message.type==='chat'&&!restoring&&chatRoom){chat.push({name:String(message.name),message:String(message.message)});if(chat.length>60)chat.shift();if(dialog.open&&tab==='world')renderChat();else game.showNotice(`${message.name}: ${message.message}`);}
+      else if(message.type==='friends'){const before=requests.length;friends=message.friends||[];requests=message.requests||[];sent=message.sent||[];visitLog=message.visitLog||visitLog;if(requests.length>before)announce('You have a new friend request!');refreshButton();if(dialog.open&&tab==='friends')render();}
+      else if(message.type==='dmSent'&&message.ok===false)announce('That message could not be delivered. Try again.');
+      else if(message.type==='guestNotice'&&message.entry){const e=message.entry as GuestEntry;visitLog=[e,...visitLog].slice(0,30);unreadLog++;refreshButton();announce(guestLine(e));if(dialog.open&&tab==='diary'){unreadLog=0;render();}}
+      else if(message.type==='visit'){
+        chatReady=true;refreshChatControls();const wasVisiting=visiting;visiting=message.home?.id||null;
+        if(message.home){const home=message.home as Home;const state={...newGame(home.name,home.color),discovered:home.discovered??['home'],plots:home.plots,gear:home.gear,...(home.farm?{farm:home.farm}:{}),...(home.placed?{placed:home.placed}:{}),...(home.decorations?{decorations:home.decorations}:{}),...(home.helper?{helper:home.helper}:{}),...(home.friends?{friends:home.friends}:{})};game.setVisiting(home.name,state as SaveState);}
+        else{game.setVisiting(null);if(message.toCommon){zone='common';const hostName=players.get(wasVisiting||'')?.name||'';announce(hostName?`Đã rời nhà của ${hostName} nè. Vào cổng lần nữa là về nhà của bạn.`:'Đã rời nhà bạn thăm. Vào cổng lần nữa là về nhà của bạn.');}else zone=null;}
+        renderPlayers();if(!message.toCommon){if(visiting)announce(`Chào mừng tới nhà của ${message.home?.name||''} nè! Ra khỏi cổng là về khu vực chung.`);else announce('Back in your garden');}if(dialog.open)render();
+      }else if(message.type==='home'&&message.home?.id===visiting)game.setVisiting(message.home.name,{discovered:message.home.discovered,plots:message.home.plots,decorations:message.home.decorations,farm:message.home.farm,helper:message.home.helper,friends:message.home.friends} as Partial<SaveState>);
+      else if(message.type==='effect'){if(message.visual)game.applyRemoteEffect(message.visual);else world().burst(message.x,message.z,message.color,8);}
+      else if(message.type==='party'){party=message.code;announce('Party code: {code}',{code:party||''});if(dialog.open)render();}
+      else if(message.type==='error'){if(chatMatches(message.requestId,connection))releaseChat();if(!message.requestId){chatReady=!!chatRoom&&connection.readyState===WebSocket.OPEN;refreshChatControls();}if(restoring&&fallbackJoin){desiredParty=null;restoring=false;joined(fallbackJoin);}announce(message.message||'That action was unavailable.');}
+    });
+    socket.addEventListener('close',event=>{
+      if(socket!==connection)return;game.setDungeonSender?.(null);chatReady=false;releaseChat(chatAttempt?.pending?'Connection interrupted. Your chat draft is kept.':undefined);authority(null);world().clearRemotePlayers();players.clear();
+      if(!account||stopped)return;if(event.code===4001){stopped=true;rejectActions('This online adventure is active in another tab.');if(saveTimer)clearTimeout(saveTimer);game.setPersistence(()=>{});status='Open in another tab';announce('This online adventure is active in another tab. Close it there, then reconnect here.');}
+      else{status='Reconnecting';reconnect=window.setTimeout(connect,2500);const epoch=sessionEpoch;void api<Session>('auth/session').then(session=>{if(socket===connection&&sessionEpoch===epoch&&account&&!session.account)expireSession();}).catch(()=>{});}refreshButton();
+    });
+    socket.addEventListener('error',()=>{if(socket!==connection)return;chatReady=false;releaseChat(chatAttempt?.pending?'Connection interrupted. Your chat draft is kept.':undefined);status='Reconnecting';refreshButton();});
+  }
+  function begin(session:Session){
+    if(!session.account||!session.profile)return;if(session.authorityVersion!==1){announce('This server needs the current game rules.');return;}sessionEpoch++;
+    if(account?.id!==session.account.id){rememberActions();rejectActions('Your session ended. Pending actions remain on this device.');clearChat();party=null;visiting=null;}
+    const previous=socket;socket=null;previous?.close();if(reconnect)clearTimeout(reconnect);if(saveTimer)clearTimeout(saveTimer);
+    if(!account)offline=structuredClone(game.getState());account=session.account;friends=session.friends||[];requests=session.requests||[];stopped=false;
+    revision=session.revision||0;try{const raw=localStorage.getItem(`cute-game-actions-${account.id}`),cached=raw?JSON.parse(raw):null;if(Array.isArray(cached))actionQueue=cached.filter(job=>job&&typeof job.requestId==='string'&&typeof job.type==='string'&&job.rulesVersion===1&&Number.isSafeInteger(job.expectedRevision)).slice(0,100);}catch{/* Keep this account's in-memory queue if storage is unavailable. */}
+    game.setPersistence(queueSave);game.setActionHandler(queueAction);game.applyState(session.profile);connect();render();void flushSave();announce('Welcome, {name}. Your online adventure is ready.',{name:account.name});
+  }
+  async function signOut(){
+    const originalEpoch=sessionEpoch;await flushSave();if(sessionEpoch!==originalEpoch)return;if(pendingSave()){announce('Your latest progress is still waiting to save. Reconnect before signing out.');return;}
+    stopped=true;const epoch=sessionEpoch;
+    try{await api('auth/logout',{});if(sessionEpoch!==epoch)return;}catch(error){if(sessionEpoch!==epoch)return;if((error as {status?:number}).status===401){expireSession();return;}stopped=false;announce((error as Error).message);return;}
+    sessionEpoch++;
+    clearChat();stopped=true;if(reconnect)clearTimeout(reconnect);if(saveTimer)clearTimeout(saveTimer);socket?.close();socket=null;account=null;host=null;party=null;visiting=null;zone=null;players.clear();authority(null);world().clearRemotePlayers();
+    game.setVisiting(null);game.setPersistence(null);game.setActionHandler(null);const state=offline||game.getOfflineState();if(state)game.applyState(state);setSaveStatus('● Saved on this device');status='Play together';refreshButton();render();announce('Your offline adventure is restored.');
+  }
+  async function reconnectOnline(){
+    const epoch=++sessionEpoch;if(reconnect)clearTimeout(reconnect);stopped=true;const previous=socket;socket=null;previous?.close();
+    try{const session=await api<Session>('auth/session');if(sessionEpoch!==epoch)return;if(!session.account){expireSession();return;}begin(session);}
+    catch(error){if(sessionEpoch===epoch)announce((error as Error).message);}
+  }
+  function labeledInput(label:string,type='text',name=label){const wrapper=el('label','social-field',t(label));const input=el('input');input.type=type;input.name=name;input.required=true;wrapper.append(input);return{wrapper,input};}
+  function personRow(person:Explorer,actions:HTMLElement[]){const row=el('div','social-person');const badge=el('span','social-avatar','●');badge.style.color=person.color;const name=el('span','',t('{name} · Lv {level}{online}',{name:person.name,level:person.level,online:person.online?t(' · online'):''}));row.append(badge,name,...actions);return row;}
+  async function friendAction(action:string,id:string){try{const list=await api<{friends:Explorer[];requests:Explorer[];sent?:Explorer[]}>(`friends/${action}`,{id});friends=list.friends;requests=list.requests;sent=list.sent??sent;refreshButton();render();}catch(error){announce((error as Error).message);}}
+  function renderChat(){const log=content.querySelector('.social-chat-log');if(!log)return;log.replaceChildren(...chat.slice(-30).map(entry=>{const line=el('p');line.append(el('strong','',entry.name+': '),document.createTextNode(entry.message));return line;}));log.scrollTop=log.scrollHeight;}
+  function render(){
+    captureChatDraft();content.replaceChildren();tabs.replaceChildren();authSubmit=null;setNotice('');heading.textContent=t(account?'Your online world':'Play together');
+    if(!account){
+      content.append(el('p','social-intro',t('Make a home, meet friends, and explore the same world. Your offline adventure stays saved separately.')));
+      const form=el('form','social-auth');const username=labeledInput('Username','text','username'),password=labeledInput('Password','password','password');username.input.autocomplete='username';username.input.pattern='[a-zA-Z0-9_]{3,24}';username.input.minLength=3;username.input.maxLength=24;password.input.autocomplete=register?'new-password':'current-password';password.input.minLength=4;password.input.maxLength=128;
+      form.append(username.wrapper,password.wrapper);let display:HTMLInputElement|undefined;
+      if(register){const name=labeledInput('Explorer name','text','display-name');name.input.maxLength=20;name.input.value=game.getState().name;display=name.input;form.append(name.wrapper);}
+      const submit=el('button','social-primary',t(register?'Create online adventure':'Sign in'));submit.type='submit';submit.disabled=authBusy;authSubmit=submit;form.append(submit);
+      form.addEventListener('submit',async event=>{event.preventDefault();if(authBusy)return;authBusy=true;submit.disabled=true;try{begin(await api<Session>(`auth/${register?'register':'login'}`,{username:username.input.value,password:password.input.value,name:display?.value,color:game.getState().color}));}catch(error){setNotice((error as Error).message);}finally{authBusy=false;submit.disabled=false;if(authSubmit)authSubmit.disabled=false;}});
+      content.append(form,button(register?'Already have an account? Sign in':'New here? Create an adventure',()=>{register=!register;render();},'social-link'),el('p','social-small',t('Accounts are stored on this game server. No email address is needed.')));return;
+    }
+    for(const [id,label]of [['world','🌍 World'],['friends',`${t('👥 Friends')}${requests.length?` (${requests.length})`:''}`],['diary',`${t('📒 Guest diary')}${unreadLog?` (${unreadLog})`:''}`],['account','🏡 Account']]as const){const item=button(label,()=>{tab=id;if(id==='diary'){unreadLog=0;refreshButton();}render();});item.setAttribute('aria-pressed',String(tab===id));tabs.append(item);}
+    if(tab==='world'){
+      content.append(el('p','social-intro',t(visiting?'Tap a ripe crop to try collecting it. A guard dog protects this garden if one lives here.':party?'Private party · {code}':'Public world · meet explorers outside your garden',{code:party||''})));
+      const actions=el('div','social-actions');actions.append(button('Create private party',()=>sendRoom({type:'party'})),button('Return to public world',()=>sendRoom({type:'join',planet:game.getState().planet})));if(visiting)actions.append(button('Return to my garden',()=>send({type:'leaveVisit'})));else actions.append(button('Share nearby loot',()=>void shareNearbyLoot()));content.append(actions);
+      const join=el('form','social-inline'),code=el('input');code.placeholder=t('Party code');code.setAttribute('aria-label',t('Party code'));code.name='party-code';code.maxLength=6;const submit=el('button','',t('Join party'));submit.type='submit';join.append(code,submit);join.addEventListener('submit',event=>{event.preventDefault();sendRoom({type:'join',planet:game.getState().planet,party:code.value.trim()});});content.append(join);
+      const roster=el('div','social-roster');roster.append(el('h3','',t('Explorers in this world ({count})',{count:players.size})));for(const player of players.values())roster.append(personRow(player,player.id===account.id?[]:[button('View explorer',()=>openPlayer(player.id))]));content.append(roster);
+      const log=el('div','social-chat-log');log.setAttribute('role','log');log.setAttribute('aria-label',t('World chat'));content.append(log);renderChat();
+      const chatForm=el('form','social-inline'),input=el('input','social-chat-input');input.placeholder=t('Say hello…');input.setAttribute('aria-label',t('Chat message'));input.name='world-chat';input.maxLength=160;input.value=chatDraft;input.addEventListener('input',()=>{chatDraft=input.value;});const chatButton=el('button','social-chat-send',t('Send'));chatButton.type='submit';chatForm.append(input,chatButton);chatForm.addEventListener('submit',event=>{event.preventDefault();submitChat();});content.append(chatForm);refreshChatControls();
+    }else if(tab==='diary'){
+      content.append(el('p','social-intro',t('Friends who visit, water, or give gifts at your home show up here.')));
+      if(!visitLog.length)content.append(el('p','social-small',t('No one has visited yet. Invite a friend to come and water your plants!')));
+      for(const e of visitLog){const row=el('div','social-person');row.append(el('span','social-avatar',e.kind==='water'?'💧':e.kind==='gift'?'🎁':e.kind==='steal'?'🕵️':e.kind==='message'?'💬':'👋'),el('span','',guestLine(e)),el('small','social-small',ago(e.at)));content.append(row);}
+    }else if(tab==='friends'){
+      const add=el('form','social-inline'),input=el('input');input.placeholder=t('Friend’s username');input.setAttribute('aria-label',t('Friend username'));input.name='friend-username';input.maxLength=24;const submit=el('button','',t('Send request'));submit.type='submit';add.append(input,submit);add.addEventListener('submit',async event=>{event.preventDefault();try{await api('friends/request',{username:input.value});announce('Friend request sent.');input.value='';}catch(error){announce((error as Error).message);}});content.append(add);
+      if(requests.length){content.append(el('h3','',t('Friend requests')));for(const friend of requests)content.append(personRow(friend,[button('Accept',()=>void friendAction('accept',friend.id)),button('Decline',()=>void friendAction('decline',friend.id))]));}
+      if(sent.length){content.append(el('h3','',t('Waiting for a reply')));for(const person of sent)content.append(personRow(person,[button('Cancel request',()=>void friendAction('cancel',person.id),'social-link')]));}
+      content.append(el('h3','',t('Your friends')));if(!friends.length)content.append(el('p','social-small',t('Add a friend by username to visit each other’s gardens.')));
+      for(const friend of friends){const gifts=el('div','social-gifts');content.append(personRow(friend,[button('Visit garden',()=>{sendRoom({type:'visit',id:friend.id});dialog.close();}),button('Send a gift',()=>giftPicker(friend.id,gifts)),button('Message',()=>messageForm(friend.id,gifts)),button('Remove friend',()=>void friendAction('remove',friend.id),'social-link')]));content.append(gifts);}
+    }else{
+      content.append(el('h3','',account.name),el('p','',t('Username: {username}',{username:account.username||''})),el('p','social-small',t('Your progress saves to this server. Returning to offline play restores the adventure you left there.')),button('Save now',async()=>{queueSave(game.getState());await flushSave();if(account)announce(pendingSave()?'Save pending. Please keep this page open.':'Online adventure saved.');}),button('Reconnect',reconnectOnline),button('Sign out and play offline',()=>void signOut(),'social-primary'));
+    }
+  }
+  game.enterCommon=enterCommon;game.exitCommon=exitCommon;game.leaveVisitToCommon=leaveVisitToCommon;
+  game.getOnlineZone=()=>zone;
+  game.visitPlayer=(id:string)=>{sendRoom({type:'visit',id});};
+  game.onFrame(dt=>{
+    if(!account||socket?.readyState!==WebSocket.OPEN)return;poseClock+=dt;enemyClock+=dt;const presence=game.getPresence();
+    if(!visiting&&presence.planet!==planet){game.setVisiting(null);planet=presence.planet;sendRoom({type:'join',planet,party});return;}
+    if(poseClock>=.1){poseClock=0;send({type:'pose',...presence});renderPlayers();}
+    // The elected browser supplies AI positions/telegraphs; the server replaces HP,
+    // damage and rewards with canonical combat values before relaying the snapshot.
+    if(host===account.id&&enemyClock>=.15){enemyClock=0;send({type:'enemies',enemies:world().enemySnapshots()});}
+  });
+  game.onAction(action=>{if(!account)return;if(action.kind==='basic')send({type:'basic',targetId:action.targetId,requestId:crypto.randomUUID()});else if(action.kind==='skill')send({type:'skill',index:action.index,requestId:crypto.randomUUID()});if(account)send({type:'effect',effect:action.special||action.kind,visual:action.effect,x:action.x,z:action.z,color:action.kind==='skill'?'#d1a6ff':'#fff2a0'});});
+  document.addEventListener('visibilitychange',()=>{send({type:'active',active:!document.hidden});if(document.hidden)void flushSave();});
+  window.addEventListener('pagehide',rememberActions);
+  onLanguageChange(()=>{
+    // Keep partially typed credentials and chat drafts while relabeling an open menu.
+    const drafts=Array.from(content.querySelectorAll<HTMLInputElement>('input')).map(input=>({name:input.name,value:input.value,focused:document.activeElement===input,start:input.selectionStart,end:input.selectionEnd}));
+    const previousNotice=noticeSource,previousParams=noticeParams;refreshButton();
+    if(dialog.open){
+      render();
+      for(const draft of drafts){const input=Array.from(content.querySelectorAll<HTMLInputElement>('input')).find(node=>node.name===draft.name);if(input){input.value=draft.value;if(draft.focused){input.focus();if(draft.start!==null&&draft.end!==null)input.setSelectionRange(draft.start,draft.end);}}}
+      setNotice(previousNotice,previousParams);
+    }
+    if(saveStatusSource)setSaveStatus(saveStatusSource);
+  });
+  refreshButton();
+  const initialEpoch=sessionEpoch;void api<Session>('auth/session').then(session=>{if(sessionEpoch===initialEpoch&&session.account)begin(session);}).catch(()=>{/* Offline play works without a server. */});
+}
+
+@@@ZOO_PATCH_FILE@@@ src/bots.ts
+import * as T from 'three';
+import * as M from './model.ts';
+import * as F from './farm.ts';
+import { CROPS, ITEMS } from './content.ts';
+import { t } from './i18n.ts';
+import { TalkBag } from './house-talk.ts';
+import { BOT_LINES, type BotScenario } from './bot-lines.ts';
+import { iconPath } from './item-icons.ts';
+import { replyTo } from './bot-chat.ts';
+import { neighboursKey } from './profiles.ts';
+import type { GameBridge } from './game-bridge.ts';
+import type { RemotePose } from './world.ts';
+import {
+  BOT_ID_PREFIX, MEET_PAUSE_MS, SAFE_RADIUS, ZONE_RADIUS, attackDamage, BOSS_SHY, bossDare, huntFor, restFor, visitStay, befriend, canMeet, choosePresent, gateRoute, givesPresent, inSafeZone, isBotId, isFriend, makeCast, newStore, nextVisitIn, parseStore, pickFoe, pickGoal, rallySpot, seeded, settleGift, walk, zoneOf,
+  type BotDef, type BotStore, type GiftNote, type WalkCtx, type Walker, type Zone,
+} from './bot-logic.ts';
+import './bots.css';
+
+/**
+ * AI neighbours for solo play: a few made-up explorers live in the common area beyond the four gates, fighting the enemies there (you meet them
+ * out there). Friends sometimes walk through a gate into your safe zone to visit your house, and stay a minute or so. A few made-up explorers share the garden with you (drawn by the same code as other players,
+ * with a name and level above their heads), each with a house you can visit once you are friends. Some are rich and wear
+ * rare outfits; the ones who can fly cross the sky now and then. Now and then one walks up, says something kind and asks to be
+ * friends; when you say yes they give you a rare gift. They only exist while you play offline, never next to real players.
+ *
+ * The gift is promised in the same step as the friendship (bot-logic befriend) and kept in the saved store until the bag has
+ * it, so closing the page, a full bag or a visit in progress can delay it but never lose it.
+ */
+const ENABLED_KEY = 'cute-game-neighbours-on', COUNT = 5;
+const AREA = { radius: 13, centre: { x: 0, z: 2 } }; // where a visiting friend wanders: inside the safe zone
+const FLY_HEIGHT = 3.1, GATE_EXIT = 19.5;
+type Mode = 'wander' | 'approach' | 'talk' | 'ask' | 'fly' | 'commute' | 'rest';
+/** `zone`: out in the common area, fighting. `garden`: a friend visiting your safe zone. */
+type Place = 'zone' | 'garden';
+interface Run {
+  def: BotDef; w: Walker; y: number; mode: Mode; modeT: number; flyY: number; say: { text: string; until: number } | null;
+  moving: boolean; nextPlan: number; chase: number; askUntil: number;
+  huntUntil: number; restUntil: number; hidden: boolean;
+  place: Place; zone: Zone; /** Clock time of the next trip into the safe zone (friends) and when the visit ends. */ visitAt: number; stayUntil: number;
+  foe: { id: string; x: number; z: number; hp: number } | null; bossUntil: number; bossShy: number; retreat: number; foeT: number; swing: number; route: Array<{ x: number; z: number }>; commuteTo: Place;
+}
+const read = (k: string) => { try { return localStorage.getItem(k); } catch { return null; } };
+const write = (k: string, v: string) => { try { localStorage.setItem(k, v); } catch { /* private mode: friendships last for this visit only */ } };
+/** The Settings switch (main.ts): on by default; the neighbours are never shown while connected to the game server, whatever it says. */
+let enabled = read(ENABLED_KEY) !== '0';
+export const neighboursOn = () => enabled;
+export function setNeighboursOn(on: boolean) { enabled = on; write(ENABLED_KEY, on ? '1' : '0'); }
+const el = <K extends keyof HTMLElementTagNameMap>(tag: K, cls = '', text = '') => { const e = document.createElement(tag); if (cls) e.className = cls; if (text) e.textContent = text; return e; };
+
+export function initBots(game: GameBridge) {
+  const world = game.getWorld(), bag = new TalkBag(), rand = Math.random;
+  const seed0 = (Date.now() ^ (Math.random() * 2 ** 32)) >>> 0;
+  const storeKey = neighboursKey(); // fixed for this session, just like the adventure loaded at startup
+  let store: BotStore = parseStore(read(storeKey), seed0);
+  const cast = makeCast(store.seed, COUNT), runs = new Map<string, Run>();
+  const save = () => write(storeKey, JSON.stringify(store));
+  save();
+  const player = () => game.getState();
+  const owns = (item: string) => game.ownsItem(item);
+  const botName = (d: BotDef) => d.name;
+
+  // ---- Where they walk ----
+  const blocked = (x: number, z: number) => world.blocked(x, z);
+  const gardenCtx: WalkCtx = { blocked, rand, radius: AREA.radius, centre: AREA.centre };
+  const zoneCtxs = new Map<string, WalkCtx>();
+  const ctxOf = (r: Run): WalkCtx => {
+    if (r.place === 'garden') return gardenCtx;
+    let c = zoneCtxs.get(r.zone.id); if (!c) zoneCtxs.set(r.zone.id, c = { blocked, rand, radius: ZONE_RADIUS - 3, centre: { x: r.zone.x, z: r.zone.z } });
+    return c;
+  };
+  const spawn = (def: BotDef): Run => {
+    const w: Walker = { x: 0, z: 0, facing: rand() * 6.28, goalX: 0, goalZ: 0, wait: 1 + rand() * 3, speed: 2.1 }, zone = zoneOf(def);
+    const r: Run = { def, w, y: 0, mode: 'wander', modeT: 0, flyY: 0, say: null, moving: false, nextPlan: 4 + rand() * 8, chase: 0, askUntil: 0, place: 'zone', zone, huntUntil: 0, restUntil: 0, hidden: false, visitAt: 0, stayUntil: 0, foe: null, bossUntil: 0, bossShy: 0, retreat: 0, foeT: 0, swing: 0, route: [], commuteTo: 'zone' };
+    placeInZone(r); r.huntUntil = clock + 60 + rand() * 120; r.visitAt = clock + 60 + nextVisitIn(rand);
+    if (rand() < .5) { r.mode = 'rest'; r.hidden = true; r.restUntil = clock + rand() * restFor(rand); } // about half are away resting when the game starts
+    return r;
+  };
+  /** Puts a neighbour at a free spot in its hunting ground. */
+  function placeInZone(r: Run) { r.place = 'zone'; const c = ctxOf(r); pickGoal(r.w, c); r.w.x = r.w.goalX; r.w.z = r.w.goalZ; pickGoal(r.w, c); r.mode = 'wander'; r.flyY = 0; r.y = 0; r.foe = null; r.route = []; r.hidden = false; }
+
+  // ---- State shared with the game ----
+  let visitingBot: string | null = null, busy: string | null = null, giftTimer = 0, clock = 0, pushClock = 0, thinkClock = 2;
+  const ready = () => game.botContext();
+  const active = () => enabled && !world.networkRole && ![...world.remotePlayers.keys()].some(id => !isBotId(id));
+
+  // ---- Speech bubbles ----
+  const bubbles = new Map<string, HTMLDivElement>(), v = new T.Vector3();
+  const sayLine = (r: Run, scenario: BotScenario, ms = 4200) => {
+    const line = bag.pick(scenario, BOT_LINES[scenario].map(p => p[0]), rand);
+    r.say = { text: t(line, { name: player().name, me: botName(r.def) }), until: clock + ms / 1000 };
+  };
+  const drawBubbles = () => {
+    for (const [id, r] of runs) {
+      let b = bubbles.get(id); const on = !!r.say && r.say.until > clock && world.remotePlayers.get(id)?.mesh.visible;
+      if (!on) { if (b) b.style.display = 'none'; continue; }
+      if (!b) { b = el('div', 'bot-bubble'); document.body.append(b); bubbles.set(id, b); }
+      const mesh = world.remotePlayers.get(id)!.mesh; v.set(mesh.position.x, mesh.position.y + 2.7 * Math.max(.6, mesh.scale.x), mesh.position.z).project(world.camera);
+      const x = (v.x + 1) / 2 * innerWidth, y = (1 - v.y) / 2 * innerHeight;
+      if (v.z > 1 || x < -60 || x > innerWidth + 60 || y < 0 || y > innerHeight) { b.style.display = 'none'; continue; }
+      if (b.textContent !== r.say!.text) b.textContent = r.say!.text;
+      b.style.display = ''; b.style.transform = `translate(${x.toFixed(0)}px, ${y.toFixed(0)}px) translate(-50%, -100%)`;
+    }
+  };
+
+  // ---- The request card ----
+  const card = el('div', 'bot-card'); card.hidden = true; card.setAttribute('role', 'dialog'); document.body.append(card);
+  let cardFor: string | null = null;
+  const closeCard = () => { card.hidden = true; cardFor = null; };
+  const outfitName = (d: BotDef) => d.gear.disguise ? t(ITEMS[d.gear.disguise]?.name ?? 'Costume') : d.gear.outfit ? t(ITEMS[d.gear.outfit]?.name ?? 'Outfit') : '';
+  function openRequest(r: Run) {
+    cardFor = r.def.id; card.replaceChildren();
+    const title = el('h3', '', `${botName(r.def)} · Lv ${r.def.level}`), text = el('p', '', t('{name} would like to be your friend.', { name: botName(r.def) }));
+    const yes = el('button', 'bot-yes', t('Be friends')), no = el('button', 'bot-no', t('Maybe later'));
+    yes.onclick = () => accept(r); no.onclick = () => decline(r);
+    card.append(title, text, el('div', 'bot-actions')); card.lastElementChild!.append(yes, no); card.hidden = false;
+  }
+  function decline(r: Run) {
+    closeCard(); sayLine(r, 'LATER'); store.meetAfter[r.def.id] = Date.now() + MEET_PAUSE_MS.declined; save(); leave(r);
+  }
+  function accept(r: Run) {
+    if (!active() || !ready().ready) return;
+    closeCard(); const now = Date.now();
+    if (!isFriend(store, r.def.id)) befriend(store, r.def, now, owns);
+    save(); sayLine(r, 'THANKS', 3200); r.mode = 'talk'; r.modeT = 2.8; r.askUntil = 0;
+    giftTimer = 0; // the promised gift follows at once (deliverGifts)
+    world.friendIds.add(r.def.id);
+  }
+  function leave(r: Run) { r.mode = 'wander'; r.modeT = 0; r.w.speed = 2.1; r.flyY = 0; busy = busy === r.def.id ? null : busy; pickGoal(r.w, ctxOf(r)); r.nextPlan = 5 + rand() * 8; }
+
+  // ---- Gifts ----
+  function showGift(def: BotDef, g: GiftNote) {
+    const box = el('div', 'bot-gift'); box.setAttribute('role', 'status');
+    const icon = g.item && iconPath(g.item) ? Object.assign(el('img', 'bot-gift-icon'), { src: `${import.meta.env.BASE_URL}assets/icons/${iconPath(g.item)}`, alt: '' }) : el('span', 'bot-gift-icon', '🎁');
+    const text = el('div'); text.append(el('b', '', t('A gift from {name}', { name: def.name })), el('span', '', g.item ? t(ITEMS[g.item]?.name ?? g.item) : t('{n} energy', { n: g.energy })));
+    if (g.item && g.energy) text.append(el('span', 'bot-gift-extra', t('+{n} energy', { n: g.energy })));
+    box.append(icon, text); document.body.append(box); setTimeout(() => box.classList.add('leaving'), 5200); setTimeout(() => box.remove(), 5600);
+  }
+  /** Hands over any gift still waiting in the store. A grant that fails (nothing playing yet, a full bag) is tried again later. */
+  const giftTries = new Map<string, number>();
+  function deliverGifts() {
+    for (const [id, gift] of Object.entries(store.pending)) {
+      const def = cast.find(d => d.id === id); if (!def) { settleGift(store, id, true); save(); continue; }
+      if (!ready().ready) return;
+      const ok = game.grantGift({ item: gift.item, count: gift.count, energy: gift.energy });
+      if (!ok) { // a failed grant keeps the promise (and the reservation) and tries again; only an item that can never be given (tried many times) turns into energy
+        const n = (giftTries.get(id) ?? 0) + 1; giftTries.set(id, n);
+        if (n >= 6 && gift.item) { settleGift(store, id, false); store.pending[id] = { ...gift, item: undefined, count: 0, energy: Math.max(gift.energy, 500) }; giftTries.delete(id); save(); }
+        return;
+      }
+      giftTries.delete(id);
+      settleGift(store, id, true); save(); showGift(def, gift); const r = runs.get(id); if (r) { sayLine(r, 'GIFT', 5000); }
+      return; // one at a time, so each popup is seen
+    }
+  }
+
+  // ---- Meetings ----
+  const playerPos = () => world.position;
+  function thinkMeet() {
+    if (busy || visitingBot) return;
+    const p = playerPos(), c = ready();
+    if (!c.ready) return;
+    // Strangers are met out in the common area only: they stay out there, so the player must be beyond the gates and close by.
+    const now = Date.now(), outside = !inSafeZone(p.x, p.z), meetable = (r: Run) => !r.hidden && (r.mode === 'wander' || r.mode === 'fly') && (r.place === 'garden' ? !outside : outside && Math.hypot(r.w.x - p.x, r.w.z - p.z) < 22);
+    const list = [...runs.values()].filter(meetable).filter(r => canMeet(store, r.def.id, now)).sort((a, b) => Math.hypot(a.w.x - p.x, a.w.z - p.z) - Math.hypot(b.w.x - p.x, b.w.z - p.z));
+    // friends say hello more rarely than strangers ask, and every meeting is worth waiting a little for
+    const r = list[0]; if (!r || rand() > .55) return;
+    r.mode = 'approach'; r.chase = 0; busy = r.def.id; r.w.speed = r.def.flies ? 6.2 : 3.3;
+  }
+  function approach(r: Run, dt: number) {
+    const p = playerPos(), dx = p.x - r.w.x, dz = p.z - r.w.z, d = Math.hypot(dx, dz);
+    r.chase += dt; r.w.goalX = p.x - dx / (d || 1) * 2.1; r.w.goalZ = p.z - dz / (d || 1) * 2.1;
+    if (r.def.flies) r.flyY = d > 6 ? FLY_HEIGHT : Math.max(0, (d - 2.4) * .5);
+    if (!ready().ready || (r.place === 'zone' && inSafeZone(p.x, p.z))) { leave(r); return; } // (a stranger never follows you through the gate)
+    if (d < 3 || r.chase > 18) {
+      if (d >= 3) { store.meetAfter[r.def.id] = Date.now() + 60_000; save(); leave(r); return; }
+      r.mode = 'talk'; r.modeT = 0; r.flyY = 0; r.w.facing = Math.atan2(dx, dz);
+      const friend = isFriend(store, r.def.id);
+      sayLine(r, friend ? 'FRIEND' : 'GREET', 3800); r.modeT = 3.2;
+    }
+  }
+  function talk(r: Run, dt: number) {
+    const p = playerPos(); r.w.facing = Math.atan2(p.x - r.w.x, p.z - r.w.z);
+    r.modeT -= dt; if (r.modeT > 0) return;
+    const now = Date.now();
+    if (!isFriend(store, r.def.id)) { r.mode = 'ask'; r.askUntil = clock + 30; sayLine(r, 'ASK', 28000); openRequest(r); return; }
+    if (givesPresent(store, r.def.id, rand, now)) {
+      const present = choosePresent(store, owns, rand);
+      if (game.grantGift(present)) { if (present.item && ITEMS[present.item]?.rare) store.given.push(present.item); store.daily[r.def.id] = now; save(); showGift(r.def, present); sayLine(r, 'GIFT', 4500); }
+    }
+    store.meetAfter[r.def.id] = now + MEET_PAUSE_MS.greeted; save(); leave(r);
+  }
+  function ask(r: Run) {
+    const p = playerPos(); r.w.facing = Math.atan2(p.x - r.w.x, p.z - r.w.z);
+    if (!ready().ready || Math.hypot(p.x - r.w.x, p.z - r.w.z) > 9 || clock > r.askUntil) { if (cardFor === r.def.id) closeCard(); store.meetAfter[r.def.id] = Date.now() + MEET_PAUSE_MS.spoke; save(); leave(r); }
+  }
+
+  // ---- The per-bot step ----
+  /** Out in the common area a neighbour hunts the nearest enemy (a gentle blow every second or so) and wanders when there is none. */
+  function hunt(r: Run, dt: number) {
+    const w = r.w, c = ctxOf(r); r.foeT -= dt; r.swing = Math.max(0, r.swing - dt);
+    if (r.place === 'zone' && helpColossus(r, dt, c)) return;
+    if (r.foe && (r.foe.hp <= 0 || !world.enemies.some(e => e.id === r.foe!.id && e.hp > 0))) r.foe = null;
+    const bossFight = !!r.foe && r.bossUntil > 0;
+    if (bossFight && clock > r.bossUntil) { // it has had enough: out of reach of the boss, which it leaves for the player
+      r.foe = null; r.bossUntil = 0; r.bossShy = clock + BOSS_SHY; r.foeT = 2; r.retreat = 2.2; w.goalX = r.zone.x; w.goalZ = r.zone.z; w.speed = 4.2; sayLine(r, 'WITHDRAW', 3800);
+    }
+    if (!r.foe && r.foeT <= 0) {
+      r.foeT = .8 + rand() * .6; const f = pickFoe(world.enemies, w, r.zone);
+      // now and then, with nothing else to fight, it tries a boss for a few seconds
+      const b = !f && clock >= r.bossShy && rand() < .35 ? pickFoe(world.enemies, w, r.zone, 18, true) : null;
+      r.foe = f ?? b ? { id: (f ?? b)!.id, x: (f ?? b)!.x, z: (f ?? b)!.z, hp: (f ?? b)!.hp } : null; r.bossUntil = b ? clock + bossDare(rand) : 0;
+    }
+    if (r.retreat > 0) { r.retreat -= dt; r.moving = walk(w, dt, c, false); return; } // backing away from the boss
+    const foe = r.foe ? world.enemies.find(e => e.id === r.foe!.id) : null;
+    if (foe && foe.hp > 0) {
+      const dx = foe.x - w.x, dz = foe.z - w.z, d = Math.hypot(dx, dz);
+      if (d > 2.4) { w.goalX = foe.x - dx / d * 1.9; w.goalZ = foe.z - dz / d * 1.9; w.speed = 3.2; r.moving = walk(w, dt, c, false); return; }
+      w.facing = Math.atan2(dx, dz); r.moving = false;
+      if (r.foeT <= 0) { r.foeT = .9 + rand() * .5; r.swing = .3; if (!foe.boss) game.botHit(foe.id, attackDamage(r.def.level)); /* a boss only gets the sparks: its bar and health belong to the player's fight */ world.burst(foe.x, foe.z, r.def.color, 6); }
+      return;
+    }
+    w.speed = 2.4;
+    if (w.wait > 0) { w.wait -= dt; r.moving = false; return; }
+    r.moving = walk(w, dt, c, false);
+    if (!r.moving) { w.wait = 1 + rand() * 3; pickGoal(w, c); }
+  }
+  /**
+   * While the daily Colossus is awake (solo, colossus.ts) every neighbour out in the wild walks to a spot round it and
+   * chips at it about once a second: small blows that never earn it any reward. Paths swing round the village fence.
+   */
+  function helpColossus(r: Run, dt: number, c: WalkCtx) {
+    const rally = game.colossusRally?.() ?? null; if (!rally) return false;
+    const w = r.w, spot = rallySpot(rally, Number(r.def.id.slice(BOT_ID_PREFIX.length)) || 0), d = Math.hypot(spot.x - w.x, spot.z - w.z);
+    r.foe = null; r.bossUntil = 0;
+    if (d > 1.2) {
+      let gx = spot.x, gz = spot.z;
+      const a0 = Math.atan2(w.z, w.x), a1 = Math.atan2(spot.z, spot.x), gap = Math.atan2(Math.sin(a1 - a0), Math.cos(a1 - a0));
+      if (Math.abs(gap) > .9 && Math.hypot(w.x, w.z) < 40) { const a = a0 + Math.sign(gap) * .8; gx = Math.cos(a) * 30; gz = Math.sin(a) * 30; }
+      w.goalX = gx; w.goalZ = gz; w.speed = 4.4; r.moving = walk(w, dt, c, false); return true;
+    }
+    w.facing = Math.atan2(rally.x - w.x, rally.z - w.z); r.moving = false;
+    if (r.foeT <= 0) { r.foeT = .9 + rand() * .6; r.swing = .3; game.colossusStrike?.(r.def.id, attackDamage(r.def.level)); }
+    return true;
+  }
+  /** Starts the walk through a gate: into the safe zone (a friend's visit) or back out to the hunting ground. */
+  function commute(r: Run, to: Place) {
+    r.mode = 'commute'; r.commuteTo = to; r.foe = null; busy = null;
+    r.route = to === 'garden' ? [...gateRoute(r.zone, true), { x: AREA.centre.x * .6 + (rand() - .5) * 6, z: AREA.centre.z * .6 + (rand() - .5) * 6 }] : [...gateRoute(r.zone, false), { x: r.zone.x, z: r.zone.z }];
+    r.w.speed = r.def.flies ? 6 : 3.4; r.flyY = r.def.flies ? FLY_HEIGHT : 0;
+  }
+  function step(r: Run, dt: number) {
+    const w = r.w;
+    switch (r.mode) {
+      case 'wander': case 'fly': {
+        r.nextPlan -= dt;
+        if (r.place === 'zone') {
+          if (r.mode === 'fly') { r.modeT -= dt; if (r.modeT <= 0) { r.mode = 'wander'; r.flyY = 0; w.speed = 2.4; } r.moving = walk(w, dt, ctxOf(r), true); if (!r.moving) pickGoal(w, ctxOf(r)); break; }
+          if (r.nextPlan <= 0) { r.nextPlan = 6 + rand() * 9; if (rand() < .2) sayLine(r, 'WANDER', 3200); else if (r.def.flies && !r.foe && rand() < .25) { r.mode = 'fly'; r.modeT = 7 + rand() * 5; w.speed = 5.5; r.flyY = FLY_HEIGHT; pickGoal(w, ctxOf(r)); if (rand() < .4) sayLine(r, 'FLYBY', 3000); } }
+          hunt(r, dt);
+          if (clock > r.huntUntil && !busy && !r.foe && r.mode === 'wander') { // back to its own safe zone for a rest: it walks away and is gone for a while
+            const k = 1 + 16 / Math.max(1, Math.hypot(r.zone.x, r.zone.z)); r.mode = 'rest'; r.route = [{ x: r.zone.x * k, z: r.zone.z * k }]; w.speed = 3; sayLine(r, 'WANDER', 2500);
+          }
+          // a friend now and then walks into the safe zone to visit the player's house (only while the player is there)
+          if (isFriend(store, r.def.id) && clock >= r.visitAt && !busy && !visitingBot && r.mode === 'wander' && !r.foe) {
+            const p = playerPos(), c = ready();
+            if (c.ready && inSafeZone(p.x, p.z)) { commute(r, 'garden'); r.stayUntil = 0; sayLine(r, 'FRIEND', 3000); } else r.visitAt = clock + 20;
+          }
+        } else { // visiting the safe zone
+          if (r.mode === 'fly') { r.modeT -= dt; if (r.modeT <= 0) { r.mode = 'wander'; r.flyY = 0; w.speed = 2.1; } }
+          else if (r.nextPlan <= 0) { r.nextPlan = 5 + rand() * 9; if (rand() < .3) sayLine(r, 'WANDER', 3200); else if (r.def.flies && rand() < .3) { r.mode = 'fly'; r.modeT = 6 + rand() * 4; w.speed = 6; r.flyY = FLY_HEIGHT; pickGoal(w, gardenCtx); } }
+          if (clock > r.stayUntil && !busy) { commute(r, 'zone'); break; }
+          if (w.wait > 0) { w.wait -= dt; r.moving = false; break; }
+          r.moving = walk(w, dt, gardenCtx, r.mode === 'fly');
+          if (!r.moving) { w.wait = r.mode === 'fly' ? 0 : 1.5 + rand() * 4; pickGoal(w, gardenCtx); }
+        }
+        break;
+      }
+      case 'commute': {
+        const next = r.route[0];
+        if (!next) { // arrived
+          r.flyY = 0; w.speed = 2.1; r.mode = 'wander';
+          if (r.commuteTo === 'garden') { r.place = 'garden'; r.stayUntil = clock + visitStay(rand); pickGoal(w, gardenCtx); }
+          else { r.place = 'zone'; r.visitAt = clock + nextVisitIn(rand); pickGoal(w, ctxOf(r)); }
+          break;
+        }
+        w.goalX = next.x; w.goalZ = next.z; r.moving = walk(w, dt, gardenCtx, true);
+        if (Math.hypot(next.x - w.x, next.z - w.z) < .6) r.route.shift();
+        break;
+      }
+      case 'rest': {
+        if (!r.hidden) {
+          const next = r.route[0]; if (next) { w.goalX = next.x; w.goalZ = next.z; r.moving = walk(w, dt, gardenCtx, true); if (Math.hypot(next.x - w.x, next.z - w.z) < .8) r.route.shift(); }
+          else { r.hidden = true; r.restUntil = clock + restFor(rand); r.moving = false; world.removeRemotePlayer(r.def.id); }
+        } else if (clock > r.restUntil) { r.hidden = false; placeInZone(r); r.huntUntil = clock + huntFor(rand); }
+        break;
+      }
+      case 'approach': approach(r, dt); r.moving = walk(w, dt, ctxOf(r), r.def.flies); break;
+      case 'talk': talk(r, dt); r.moving = false; break;
+      case 'ask': ask(r); r.moving = false; break;
+    }
+    // altitude eases toward the plan; walking bots stay on the ground
+    r.y += (r.flyY - r.y) * Math.min(1, dt * 3);
+  }
+  function pose(r: Run): RemotePose {
+    const d = r.def, flying = r.y > .4;
+    return {
+      id: d.id, x: r.w.x, z: r.w.z, y: r.y + (flying ? Math.sin(clock * 2 + d.level) * .12 : 0) + (r.swing > 0 ? Math.sin(r.swing / .3 * Math.PI) * .25 : 0), facing: r.w.facing, color: d.color, name: d.name, planet: 'home', moving: r.moving || flying || r.swing > 0,
+      gear: (d.pets.length ? { ...d.gear, pet: d.pets[0] } : d.gear) as RemotePose['gear'], pets: d.pets.slice(1), level: d.level, hp: 100, visual: flying ? { flight: 1 } : { flight: 0 },
+    };
+  }
+
+  // ---- House visits ----
+  function buildHome(def: BotDef): Partial<M.SaveState> {
+    const now = Date.now(), s = M.newGame(def.name), r = seeded(def.level * 7919 + def.name.length);
+    s.level = 60; s.energy = 1e9; s.planet = 'home';
+    while (s.plots.length < def.house.plots && M.expandGarden(s)) { /* each call places one more bed */ }
+    s.plots.forEach((p, i) => {
+      const crop = def.house.crops[i % def.house.crops.length], dur = (CROPS[crop]?.duration ?? 3_600_000), seedId = CROPS[crop]?.seed;
+      if (seedId) s.bag[seedId] = (s.bag[seedId] || 0) + 1;
+      M.plant(s, i, crop, now - Math.floor(dur * (.2 + r() * 1.3)));
+    });
+    if (def.house.animals.length && F.buildPen(s)) {
+      const kinds = [...new Set(def.house.animals)];
+      if (def.tier === 'rich') { F.expandPen(s); F.expandPen(s); }
+      for (const kind of kinds) F.buildSpeciesPen(s, kind, now);
+      for (const kind of def.house.animals) F.buyAnimal(s, kind, now - Math.floor((.05 + r() * .9) * 3_600_000));
+    }
+    const spots: Array<[number, number]> = [[-6, 9], [6, 9], [-12, 6], [12, 6], [0, 13], [-9, 12], [9, 12]];
+    def.house.decor.forEach((id, i) => { s.bag[id] = (s.bag[id] || 0) + 1; for (let k = 0; k < spots.length; k++) { const [x, z] = spots[(i + k) % spots.length]; if (M.placeDecoration(s, id, x, z, r() * 6)) break; } });
+    return { name: def.name, discovered: ['home'], plots: s.plots, decorations: s.decorations, farm: s.farm } as Partial<M.SaveState>;
+  }
+  function visit(def: BotDef) {
+    if (!active() || !ready().ready || !isFriend(store, def.id)) return;
+    visitingBot = def.id; busy = def.id; closeCard();
+    game.setVisiting(def.name, buildHome(def));
+    for (const [id, r] of runs) if (id !== def.id) world.removeRemotePlayer(id); else { r.place = 'garden'; r.hidden = false; r.route = []; r.foe = null; r.retreat = 0; r.say = null; r.mode = 'wander'; r.stayUntil = clock + 1e9; r.flyY = 0; r.w.x = 4; r.w.z = 4; pickGoal(r.w, gardenCtx); }
+    showLeave(def);
+  }
+  const leaveBtn = el('button', 'bot-leave'); leaveBtn.hidden = true; document.body.append(leaveBtn);
+  function showLeave(def: BotDef) {
+    leaveBtn.textContent = t('Leave {name}\'s garden', { name: def.name }); leaveBtn.hidden = false;
+    leaveBtn.onclick = endVisit;
+  }
+  /** Back to your own garden: from the button, or by walking out of a gate (the wild beyond belongs to you, and so does the way home). */
+  function endVisit() {
+    if (!visitingBot) return;
+    leaveBtn.hidden = true; visitingBot = null; busy = null; game.setVisiting(null); for (const r of runs.values()) { r.w.facing = 0; placeInZone(r); r.visitAt = clock + nextVisitIn(rand); }
+  }
+  /** Cho common-gates.ts gọi khi người chơi đi bộ ra cổng lúc đang thăm nhà AI (offline): dọn state visit ở local. */
+  game.leaveBotVisit = endVisit;
+
+  // ---- The neighbours panel ----
+  const dialog = el('dialog', 'social-dialog bot-dialog'); dialog.setAttribute('aria-label', t('Neighbours')); document.body.append(dialog);
+  // ---- The message box ----
+  const logs = new Map<string, Array<{ me: boolean; text: string }>>(); let chatWith: BotDef | null = null, draft = '', session = 0;
+  function renderChat(d: BotDef) {
+    chatWith = d; dialog.replaceChildren();
+    const header = el('header', 'social-header'), close = el('button', 'social-close', '✕'); close.setAttribute('aria-label', t('Close')); close.onclick = () => { chatWith = null; dialog.close(); };
+    const back = el('button', 'bot-back', '‹ ' + t('Back')); back.onclick = () => { chatWith = null; renderPanel(); };
+    header.append(back, el('h2', '', `${isFriend(store, d.id) ? '💚 ' : ''}${d.name} · Lv ${d.level}`), close);
+    const body = el('div', 'social-content bot-chat'), log = el('div', 'bot-log'), form = el('form', 'bot-form'), input = el('input'), send = el('button', 'bot-send', t('Send'));
+    input.type = 'text'; input.maxLength = 160; input.placeholder = t('Type a message…'); input.value = draft; input.autocomplete = 'off'; input.setAttribute('aria-label', t('Message'));
+    input.oninput = () => { draft = input.value; }; send.type = 'submit';
+    const lines = logs.get(d.id) ?? (logs.set(d.id, [{ me: false, text: t('Hello, {name}! So nice to hear from you.', { name: player().name }) }]), logs.get(d.id)!);
+    for (const m of lines) log.append(el('p', m.me ? 'bot-msg me' : 'bot-msg', m.text));
+    form.onsubmit = event => {
+      event.preventDefault(); const text = input.value.trim().slice(0, 160); if (!text) return;
+      input.value = ''; draft = ''; lines.push({ me: true, text }); log.append(el('p', 'bot-msg me', text)); log.scrollTop = log.scrollHeight;
+      const typing = el('p', 'bot-msg typing', '…'); log.append(typing); log.scrollTop = log.scrollHeight;
+      const reply = replyTo(text, d, isFriend(store, d.id), { pick: (key, pool) => bag.pick(key, pool, rand), rand });
+      const replySession = session;
+      window.setTimeout(() => {
+        if (replySession !== session) return;
+        const out = t(reply, { name: player().name, me: d.name, level: d.level }); lines.push({ me: false, text: out }); if (lines.length > 40) lines.splice(0, lines.length - 40);
+        typing.remove(); if (chatWith === d && dialog.open) { log.append(el('p', 'bot-msg', out)); log.scrollTop = log.scrollHeight; }
+        const r = runs.get(d.id); if (r) r.say = { text: out, until: clock + 5 };
+      }, 500 + rand() * 700);
+    };
+    form.append(input, send); body.append(log, form); dialog.append(header, body); log.scrollTop = log.scrollHeight;
+  }
+  function renderPanel() {
+    chatWith = null; dialog.replaceChildren();
+    const header = el('header', 'social-header'), close = el('button', 'social-close', '✕'); close.setAttribute('aria-label', t('Close')); close.onclick = () => dialog.close();
+    header.append(el('h2', '', `🏘️ ${t('Neighbours')}`), close);
+    const body = el('div', 'social-content bot-list');
+    const toggle = el('label', 'bot-toggle'), box = el('input'); box.type = 'checkbox'; box.checked = enabled; box.onchange = () => { setNeighboursOn(box.checked); renderPanel(); };
+    toggle.append(box, document.createTextNode(' ' + t('Show AI neighbours')));
+    body.append(el('p', 'social-small', t('Neighbours fight enemies in the wild beyond the four gates, so go out and meet them there. Some are rich and wear rare outfits. Become friends and they give you gifts, let you visit their gardens, and sometimes walk in through a gate to visit yours.')), toggle);
+    for (const d of cast) {
+      const row = el('section', 'bot-row'), friend = isFriend(store, d.id);
+      const info = el('div', 'bot-info'); info.append(el('b', '', `${friend ? '💚 ' : ''}${d.name} · Lv ${d.level}`), el('span', 'social-small', `${d.tier === 'rich' ? '💎 ' : ''}${outfitName(d)}${d.flies ? ' · ' + t('flies') : ''}`));
+      const visitBtn = el('button', '', t('Visit garden')); visitBtn.disabled = !friend || !!visitingBot; visitBtn.title = friend ? '' : t('Become friends first.');
+      visitBtn.onclick = () => { dialog.close(); visit(d); };
+      const chatBtn = el('button', '', `💬 ${t('Chat')}`); chatBtn.onclick = () => renderChat(d);
+      const acts = el('div', 'bot-acts'); acts.append(chatBtn, visitBtn); row.append(info, acts); body.append(row);
+    }
+    dialog.append(header, body);
+  }
+  const slot = document.querySelector('#social-slot');
+  const panelBtn = el('button', 'social-toggle bot-open', '🏘️'); panelBtn.id = 'neighbours-button'; panelBtn.title = t('Neighbours'); panelBtn.setAttribute('aria-label', t('Neighbours'));
+  panelBtn.onclick = () => { renderPanel(); dialog.showModal(); };
+  if (slot) { slot.append(panelBtn); panelBtn.classList.add('social-inline-toggle'); } else document.body.append(panelBtn);
+
+  // ---- Clicking a neighbour ----
+  const previousClick = world.onRemotePlayerClick;
+  world.onRemotePlayerClick = id => {
+    if (!isBotId(id)) { previousClick?.(id); return; }
+    const r = runs.get(id); if (!r) return;
+    if (!isFriend(store, id) && !busy && ready().ready) { r.mode = 'approach'; r.chase = 0; busy = id; r.w.speed = r.def.flies ? 6.2 : 3.3; return; }
+    const d = cast.find(b => b.id === id); if (d) { renderChat(d); dialog.showModal(); }
+  };
+
+  // ---- Every frame ----
+  game.onFrame(dt => {
+    const on = active();
+    if (!on) { endVisit(); for (const id of [...runs.keys()]) { world.removeRemotePlayer(id); bubbles.get(id)?.remove(); bubbles.delete(id); } runs.clear(); busy = null; closeCard(); leaveBtn.hidden = true; visitingBot = null; panelBtn.hidden = !enabled || !!world.networkRole; return; }
+    panelBtn.hidden = world.planet !== 'home' || !!world.interior;
+    if (!ready().active) {
+      // Keep the visit and its timers while a menu is open, but never simulate combat in a paused or different world.
+      for (const [id, r] of runs) {
+        r.moving = false;
+        const remote = world.remotePlayers.get(id); if (remote) remote.pose.moving = false;
+        if (world.planet !== 'home' || world.interior) world.removeRemotePlayer(id);
+      }
+      for (const bubble of bubbles.values()) bubble.style.display = 'none';
+      card.hidden = true;
+      return;
+    }
+    clock += Math.min(.1, dt);
+    if (cardFor) card.hidden = false;
+    for (const d of cast) {
+      if (visitingBot && d.id !== visitingBot) continue;
+      if (!runs.has(d.id)) runs.set(d.id, spawn(d));
+    }
+    for (const id of [...runs.keys()]) if (visitingBot && id !== visitingBot) { world.removeRemotePlayer(id); runs.delete(id); bubbles.get(id)?.remove(); bubbles.delete(id); }
+    const d = Math.min(.1, dt);
+    // Through any of the four gates (18 m out) is the wild, with its enemies; returning through the gate lands you in your own safe zone.
+    if (visitingBot && Math.hypot(world.position.x, world.position.z) > GATE_EXIT) { endVisit(); game.showNotice(t('You left through the gate. Your own garden is waiting when you come back.')); return; }
+    for (const r of runs.values()) step(r, d);
+    pushClock -= d; if (pushClock <= 0) { pushClock = 1 / 12; for (const [id, r] of runs) { if (r.hidden) continue; const p = pose(r); if (world.remotePlayers.has(id)) world.updateRemotePlayer(id, p); else world.addRemotePlayer(id, p); } }
+    for (const id of Object.keys(store.friends)) world.friendIds.add(id);
+    thinkClock -= d; if (thinkClock <= 0) { thinkClock = 3; if (!visitingBot) thinkMeet(); }
+    giftTimer -= d; if (giftTimer <= 0) { giftTimer = 1.5; deliverGifts(); }
+    drawBubbles();
+  });
+  function reset() {
+    session++;
+    endVisit(); closeCard(); dialog.close(); logs.clear(); chatWith = null; draft = '';
+    for (const id of runs.keys()) world.removeRemotePlayer(id);
+    for (const id of Object.keys(store.friends)) world.friendIds.delete(id);
+    for (const bubble of bubbles.values()) bubble.remove();
+    bubbles.clear(); runs.clear(); giftTries.clear(); busy = null;
+    clock = pushClock = giftTimer = 0; thinkClock = 2;
+    store = newStore(store.seed); save();
+  }
+  return { cast, store: () => store, accept: (id: string) => { const r = runs.get(id); if (r) accept(r); }, reset, runs };
+}
+export type NeighbourApi = ReturnType<typeof initBots>;
+void BOT_ID_PREFIX;
+
+@@@ZOO_PATCH_FILE@@@ src/game-bridge.ts
+import type { SaveState } from './model.ts';
+import type { World } from './world.ts';
+import type { CombatHit, CombatEffect } from './combat.ts';
+import type {GameIntent,ActionReply} from './actions.ts';
+export type EnemyStatus='fear'|'charm'|'slow'|'blind'|'sheep'|'taunt';
+export interface GamePresence { y:number;x:number;z:number;facing:number;planet:string;name:string;color:string;level:number;hp:number;maxHp:number;gear:SaveState['gear'];moving:boolean;visible:boolean;visual?:{size:number;stealth:boolean;shield:boolean;flight:number;bat:boolean} }
+export interface GameAction { kind:'basic'|'skill'|'effect';targetId?:string;index?:number;special?:string;x:number;z:number;facing:number;effect?:unknown }
+export interface NetworkHooks {
+  role:'host'|'peer'|null;
+  visitCrop?:(index:number)=>void;
+  reportDamage?:(enemyId:string,source:string)=>void;
+  hit?:(enemyId:string,damage:number,stun:number,impact?:CombatHit)=>boolean;
+  status?:(enemyId:string,kind:EnemyStatus,duration:number)=>boolean;
+  moveTarget?:(enemyId:string,x:number,z:number)=>boolean;
+  onHostKill?:(enemyId:string,xp:number,boss:boolean,type:string)=>void;
+  onRemoteDamage?:(playerId:string,amount:number)=>void;
+}
+export interface NetworkDrop {id:string;ownerId:string;item:string;count:number;room:string;planet:string;x:number;z:number;owner:string;releaseAt:number;expiresAt:number;thrown?:boolean}
+export interface GameBridge {
+  spawnNetworkDrop(drop:NetworkDrop,actor:string):void;removeNetworkDrop(id:string):void;releaseNetworkDrop(id:string):void;clearNetworkDrops():void;
+  applyAuthorityHealth(delta:number,died:boolean):void;
+  getState():SaveState;applyState(next:SaveState):void;getWorld():World;getPresence():GamePresence;
+  getOfflineState():SaveState|null;setPersistence(handler:((state:SaveState)=>void)|null):void;
+  setActionHandler(handler:((intent:GameIntent)=>Promise<ActionReply>)|null):void;
+  applyAuthoritativeState(next:SaveState):void;
+  setNetworkHooks(hooks:NetworkHooks):void;
+  applyRemoteHit(enemyId:string,damage:number,stun?:number,impact?:CombatHit):void;
+  applyRemoteStatus(enemyId:string,kind:EnemyStatus,duration:number):void;
+  applyRemoteMove(enemyId:string,x:number,z:number):void;
+  applySharedKill(enemyId:string,xp:number,boss:boolean,type?:string):void;
+  applyRemoteDamage(amount:number,source?:string):void;
+  applyRemoteEffect(effect:CombatEffect):void;
+  setVisiting(owner:string|null,homeState?:Partial<SaveState>):void;
+  showNotice(text:string):void;
+  /** Cổng khu chung (Đồng Cỏ Hồ Xanh): vào/ra khu chung */
+  enterCommon?():void;exitCommon?():void;
+  /** Rời nhà đang thăm về khu chung (không teleport). Trả về true khi đã gửi
+   *  cho server (visit online thật); false khi offline hoặc đang thăm nhà AI
+   *  (bots.ts) → caller tự dọn state ở local. */
+  leaveVisitToCommon?():boolean;
+  /** Kết thúc lượt thăm nhà Hàng xóm AI (bots.ts): reset visitingBot, nút Rời đi, runs. */
+  leaveBotVisit?():void;
+  /** Zone hiện tại của người chơi online: 'common' khi ở khu chung, null khi ở nhà riêng */
+  getOnlineZone?(): 'common'|null;
+  /** Thăm nhà người chơi khác qua cổng (thay vì qua menu bạn bè) */
+  visitPlayer?(id:string):void;
+  /** AI neighbours (bots.ts): does the player already have this item; hand over a gift (items and/or energy; false when it cannot be given now); may a neighbour walk up and talk now. */
+  /** A neighbour's blow on an enemy (bots.ts): the enemy takes the damage and falls, but a kill pays the player nothing, wherever it happens, and it never touches the player's target ring, hit-stop or HUD. */
+  botHit(enemyId:string,damage:number):void;
+  /** The daily Colossus neighbours may help against (solo, at home, awake), and a neighbour's blow on it (never rewarded). */
+  colossusRally?():{id:string;x:number;z:number;r:number}|null;colossusStrike?(botId:string,damage:number):void;
+  ownsItem(id:string):boolean;grantGift(gift:{item?:string;count:number;energy:number}):boolean;botContext():{active:boolean;ready:boolean};
+  /** The Delvers' Vault online (dungeon.ts): a dg* message from the server, and the way to send one (null when offline). */
+  dungeonMessage?(message:{type:string;[key:string]:unknown}):void;
+  setDungeonSender?(send:((message:Record<string,unknown>)=>boolean)|null):void;
+  onFrame(listener:(dt:number)=>void):()=>void;
+  onAction(listener:(action:GameAction)=>void):()=>void;
+}
+
+@@@ZOO_PATCH_END@@@

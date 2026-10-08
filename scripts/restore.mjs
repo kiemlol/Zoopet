@@ -3,8 +3,8 @@
 // Chay sau khi clone repo:  node scripts/restore.mjs
 // Yeu cau: may co san lenh `tar` (Windows 10+, macOS, Linux deu co).
 
-import { readdir, readFile, writeFile, unlink } from 'fs/promises';
-import { join, dirname } from 'path';
+import { readdir, readFile, writeFile, unlink, mkdir } from 'fs/promises';
+import { join, dirname, sep } from 'path';
 import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
 
@@ -38,10 +38,51 @@ async function restoreArchive(archiveDirName, outputName) {
   console.log(`[restore] xong ${archiveDirName}.`);
 }
 
+// Dap cac file hotfix (patch bundle) len source vua giai nen.
+// Dinh dang bundle: dong "@@@ZOO_PATCH_FILE@@@ <duong dan tu root>" + nguyen van noi dung file,
+// ket thuc bang "@@@ZOO_PATCH_END@@@". Dung khi archive/ chua duoc tai tao de gom fix.
+async function applyPatchBundles(patchesDirName) {
+  const patchesDir = join(root, patchesDirName);
+  let files;
+  try {
+    files = (await readdir(patchesDir)).filter((f) => f.endsWith('.patchbundle')).sort();
+  } catch {
+    return;
+  }
+  for (const f of files) {
+    console.log(`[patch] dang dap ${patchesDirName}/${f}...`);
+    const text = await readFile(join(patchesDir, f), 'utf8');
+    const sections = text.split(/^@@@ZOO_PATCH_FILE@@@ /m);
+    let count = 0;
+    for (const s of sections) {
+      const nl = s.indexOf('\n');
+      if (nl < 0) continue;
+      const rel = s.slice(0, nl).trim();
+      if (!rel || rel === '@@@ZOO_PATCH_END@@@' || rel.startsWith('#')) continue;
+      const dest = join(root, rel);
+      if (dest !== root && !dest.startsWith(root + sep)) {
+        console.log(`[patch] bo qua path la: ${rel}`);
+        continue;
+      }
+      let body = s.slice(nl + 1);
+      const endMark = '\n@@@ZOO_PATCH_END@@@';
+      const ei = body.indexOf(endMark);
+      if (ei >= 0) body = body.slice(0, ei) + '\n';
+      else body = body.replace(/\n+$/, '\n');
+      await mkdir(dirname(dest), { recursive: true });
+      await writeFile(dest, body);
+      count++;
+    }
+    console.log(`[patch] xong ${f}: ${count} file.`);
+  }
+}
+
 // 1. Source code (text)
 await restoreArchive('archive', 'src-text.tar.gz');
 // 2. Assets binary (public/: model .glb, anh, am thanh)
 await restoreArchive('public-archive', 'public.tar.gz');
+// 3. Hotfix chua co trong archive/
+await applyPatchBundles('patches');
 
 console.log('[restore] HOAN TAT! Chay tiep:');
 console.log('  npm install        # cai dependencies');
