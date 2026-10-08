@@ -1,6 +1,25 @@
-# Zoo Garden
+# Zoo Pet
 
-A browser adventure built against the gameplay of Zoo Pet, with independently authored Three.js code, original Blender assets, and local multiplayer services. The expanded build includes the reference crop, equipment, creature, progression and crafting catalogs, along with full-size worlds and their activities.
+A browser adventure game (trồng cây, câu cá, săn quái, bay vũ trụ, multiplayer) — Three.js, Vite, Node.js.
+
+## Khôi phục source từ GitHub
+
+Source code đầy đủ được lưu trong `archive/` (chia thành 18 phần `.b64` do giới hạn kỹ thuật). Sau khi clone repo:
+
+```sh
+node scripts/restore.mjs   # ghép + giải nén source
+npm run prebuild           # giải mã assets binary (.b64 -> file thật)
+npm install
+npm run dev
+```
+
+## Assets nhị phân (.b64)
+
+Các file binary trong `public/` (model `.glb`, ảnh `.webp/.png`, âm thanh...) được lưu trên git dưới dạng **base64 text** với đuôi `.b64` (ví dụ `public/assets/models/fox.glb.b64`), do giới hạn của công cụ push.
+
+- `npm run build` / Vercel: script `prebuild` (`scripts/decode-assets.mjs`) tự động giải mã `.b64` → file binary trước khi build.
+- Sau khi **clone repo về máy**, chạy một lần: `npm run prebuild` để giải mã assets.
+- Không commit file binary đã giải mã (đã có trong `.gitignore`).
 
 ## Run
 
