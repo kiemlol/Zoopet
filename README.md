@@ -1,6 +1,6 @@
 # Zoo Pet
 
-A browser adventure game (trồng cây, câu cá, săn quái, bay vũ trụ, multiplayer) — Three.js, Vite, Node.js.
+A browser adventure game (trồng câyy, câu cá, săn quái, bay vũ trụ, multiplayer) — Three.js, Vite, Node.js.
 
 ## Khôi phục source từ GitHub
 
